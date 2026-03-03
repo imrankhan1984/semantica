@@ -65,7 +65,14 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# Defensive fallback: keep `Type` defined for environments or refactors
+# where typing imports may drift and runtime annotations still reference it.
+try:
+    from typing import Type
+except Exception:  # pragma: no cover
+    Type = type
 
 
 def format_data(data: Any, format_type: str = "json") -> str:
