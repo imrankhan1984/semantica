@@ -1682,7 +1682,7 @@ def extract_relations_llm(
         "entities_hash": hash(tuple(sorted([e.text for e in entities]))) if entities else 0
     }
     cached_result = _result_cache.get("relations", text, **cache_params)
-    if cached_result:
+    if cached_result is not None:
         logger.debug(f"Cache hit for relation extraction ({len(cached_result)} relations)")
         return cached_result
     
