@@ -71,3 +71,21 @@ def test_ttl_export_to_file(exporter, tmp_path):
     exporter.export(RDF_DATA, str(out), format="ttl")
     assert out.exists()
     assert out.stat().st_size > 0
+
+
+def test_non_string_format_raises_validation_error(exporter):
+    """format=None or non-string must raise ValidationError, not AttributeError."""
+    from semantica.utils.exceptions import ValidationError
+
+    with pytest.raises(ValidationError):
+        exporter.export_to_rdf(RDF_DATA, format=None)
+
+    with pytest.raises(ValidationError):
+        exporter.export_to_rdf(RDF_DATA, format=123)
+
+
+def test_validate_rdf_returns_overall_valid_key(exporter):
+    """validate_rdf() must return 'overall_valid' key (used in notebook example)."""
+    result = exporter.validate_rdf(RDF_DATA)
+    assert "overall_valid" in result
+    assert isinstance(result["overall_valid"], bool)

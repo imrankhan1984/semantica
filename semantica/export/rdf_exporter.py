@@ -901,7 +901,12 @@ class RDFExporter:
         )
 
         try:
-            format = self._format_aliases.get(format.lower(), format.lower())
+            if not isinstance(format, str):
+                raise ValidationError(
+                    f"RDF format must be a string, got: {type(format).__name__}"
+                )
+            fmt = format.strip().lower()
+            format = self._format_aliases.get(fmt, fmt)
             if format not in self.supported_formats:
                 raise ValidationError(
                     f"Unsupported RDF format: {format}. "
