@@ -19,6 +19,7 @@ Relation Extraction:
     - "pattern": Pattern-based relation extraction
     - "regex": Advanced regex-based relation extraction
     - "cooccurrence": Co-occurrence based relation detection
+    - "similarity": Similarity-based relation extraction
     - "dependency": Dependency parsing-based relation extraction
     - "huggingface": HuggingFace relation extraction models
     - "llm": LLM-based relation extraction
@@ -106,7 +107,9 @@ License: MIT
 """
 
 import re
-from typing import Any, Dict, List, Optional, Union
+import difflib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from ..utils.exceptions import ProcessingError
 from ..utils.logging import get_logger
@@ -115,16 +118,446 @@ from .providers import HuggingFaceModelLoader, create_provider
 from .registry import method_registry
 from .relation_extractor import Relation
 from .triplet_extractor import Triplet
+from .cache import ExtractionCache
+from .config import config
+
+try:
+    from .schemas import EntitiesResponse, RelationsResponse, TripletsResponse
+    SCHEMAS_AVAILABLE = True
+except ImportError:
+    SCHEMAS_AVAILABLE = False
 
 logger = get_logger("methods")
 
-# Try to import spaCy
-try:
-    import spacy
+# Initialize global result cache
+_result_cache = ExtractionCache(
+    ttl=config.get("cache_ttl", 3600)
+)
+if not config.get("cache_enabled", True):
+    _result_cache.enabled = False
 
-    SPACY_AVAILABLE = True
-except ImportError:
-    SPACY_AVAILABLE = False
+# Try to import spaCy
+from ..utils.helpers import safe_import
+
+spacy, SPACY_AVAILABLE = safe_import("spacy")
+
+
+# ============================================================================
+# Scoring Helper Functions
+# ============================================================================
+
+# Global cache for spacy model and text embedder to avoid reloading
+_nlp_cache = None
+_embedder_cache = None
+
+def get_text_embedder():
+    """
+    Get or load the TextEmbedder model for high-accuracy semantic similarity.
+    """
+    global _embedder_cache
+    if _embedder_cache:
+        return _embedder_cache
+        
+    try:
+        from ..embeddings.text_embedder import TextEmbedder
+        # Use a lightweight but effective model for speed/accuracy balance
+        # BAAI/bge-small-en-v1.5 is excellent for semantic similarity
+        # Enable caching within the embedder if supported, or use our own
+        _embedder_cache = TextEmbedder(model_name="BAAI/bge-small-en-v1.5", normalize=True)
+        logger.info("Loaded TextEmbedder for high-accuracy similarity")
+        return _embedder_cache
+    except Exception as e:
+        logger.warning(f"Failed to load TextEmbedder: {e}")
+        return None
+
+def get_nlp_model():
+    """
+    Get or load a spaCy model for similarity calculations.
+    Prioritizes larger models for better vectors.
+    """
+    global _nlp_cache
+    if _nlp_cache:
+        return _nlp_cache
+    
+    if not SPACY_AVAILABLE:
+        return None
+        
+    try:
+        # Prefer larger models for vectors
+        # Note: 'en_core_web_lg' has true vectors. 'sm' only has context tensors.
+        for model_name in ["en_core_web_lg", "en_core_web_md", "en_core_web_sm"]:
+            if spacy.util.is_package(model_name):
+                try:
+                    # Disable parser/ner for speed if we only need vectors
+                    _nlp_cache = spacy.load(model_name, disable=["parser", "ner", "lemmatizer"])
+                    logger.info(f"Loaded spaCy model for similarity: {model_name}")
+                    return _nlp_cache
+                except Exception:
+                    continue
+        
+        # Try loading generic if specific ones fail
+        try:
+            _nlp_cache = spacy.load("en_core_web_sm", disable=["parser", "ner", "lemmatizer"])
+            return _nlp_cache
+        except:
+            pass
+            
+    except Exception as e:
+        logger.warning(f"Failed to load spaCy model for similarity: {e}")
+        pass
+    return None
+
+# Common synonyms for entity matching optimization
+_ENTITY_SYNONYMS = {
+    # Entity Types
+    "person": ["people", "human", "name", "individual", "artist", "actor", "author", "politician"],
+    "org": ["company", "organization", "business", "institution", "agency", "brand", "corporation"],
+    "organization": ["company", "business", "institution", "agency", "brand", "corporation"],
+    "gpe": ["location", "place", "city", "country", "state", "nation", "region"],
+    "loc": ["location", "place", "region", "area"],
+    "date": ["time", "year", "day", "month", "period", "duration"],
+    "money": ["cost", "price", "value", "currency", "amount"],
+    "product": ["item", "object", "commodity", "goods", "device", "tool", "vehicle", "software", "app"],
+    "event": ["incident", "occasion", "activity", "happening", "ceremony"],
+    "drug": ["medication", "medicine", "pharmaceutical", "chemical", "treatment", "therapy"],
+    "chemical": ["drug", "substance", "compound", "element"],
+    "disease": ["condition", "illness", "sickness", "disorder", "syndrome", "ailment"],
+    
+    # Relation Types
+    "founded_by": ["founder", "creator", "established_by", "started_by", "originator"],
+    "acquired": ["bought", "purchased", "acquisition", "takeover", "ownership", "merged_with"],
+    "subsidiary_of": ["owned_by", "parent_company", "part_of", "division_of", "unit_of"],
+    "works_for": ["employee_of", "employed_by", "staff_of", "team_member", "employs", "hired_by"],
+    "located_in": ["based_in", "headquartered_in", "situated_in", "found_in", "operates_in"],
+    "ceo_of": ["leader_of", "head_of", "director_of", "president_of", "chief_executive", "managed_by"],
+    "invested_in": ["funded", "financed", "backed", "shareholder_of", "venture_capital"],
+    "partner_with": ["collaborate_with", "joint_venture", "alliance", "deal_with", "partnership"],
+    "competitor_of": ["rival", "competes_with", "opponent", "nemesis"],
+    "manufacturer_of": ["producer_of", "maker_of", "creator_of", "builder_of"],
+    "treats": ["cures", "heals", "remedy_for", "used_for", "prescribed_for"],
+    "causes": ["leads_to", "results_in", "triggers", "produces", "creates"],
+    "diagnosed_with": ["suffers_from", "has_condition", "patient_of", "victim_of"],
+}
+
+def find_best_match_index(text: str, candidates: List[str]) -> Tuple[int, float]:
+    """
+    Find the best matching candidate index and score.
+    Uses hybrid similarity approach: Exact -> Synonym -> Substring -> Embeddings -> Vector -> Fuzzy.
+    Optimized for batch processing to avoid redundant embedding calculations.
+    
+    Returns:
+        Tuple[int, float]: (best_candidate_index, best_score). Index is -1 if no candidates.
+    """
+    if not candidates:
+        return -1, 0.0
+    
+    if not text:
+        return -1, 0.0
+        
+    text_lower = text.lower().strip()
+    if not text_lower:
+        return -1, 0.0
+        
+    candidates_lower = [c.lower().strip() for c in candidates]
+    best_idx = -1
+    best_score = 0.0
+    
+    # 1. Exact Match (Fastest)
+    try:
+        idx = candidates_lower.index(text_lower)
+        return idx, 1.0
+    except ValueError:
+        pass
+
+    # 1b. Common Synonyms (Fast Heuristic)
+    # Use global _ENTITY_SYNONYMS dictionary
+    synonyms = _ENTITY_SYNONYMS
+    
+    # Check text synonyms
+    if text_lower in synonyms:
+        for syn in synonyms[text_lower]:
+            if syn in candidates_lower:
+                return candidates_lower.index(syn), 0.95
+    
+    # Check if any candidate is a synonym of text
+    for i, cand in enumerate(candidates_lower):
+        if cand in synonyms:
+            if text_lower in synonyms[cand]:
+                if 0.95 > best_score:
+                    best_score = 0.95
+                    best_idx = i
+    
+    # 2. Substring Match (Fast)
+    word_pat = None
+    try:
+        word_pat = re.compile(rf"\b{re.escape(text_lower)}\b")
+    except Exception:
+        word_pat = None
+
+    for i, cand in enumerate(candidates_lower):
+        if not cand: continue
+        score = 0.0
+        if text_lower in cand or cand in text_lower:
+            # Calculate length ratio
+            ratio = min(len(text_lower), len(cand)) / max(len(text_lower), len(cand))
+            score = 0.9 * ratio + 0.1
+
+            if word_pat and word_pat.search(cand):
+                score = max(score, 0.88)
+        
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    # 3. Text Embeddings (High Accuracy Semantic) - Batch Optimized
+    if best_score >= 0.85:
+        return best_idx, float(best_score)
+
+    embedder = get_text_embedder()
+    embedding_idx = -1
+    embedding_score = 0.0
+    
+    if embedder:
+        try:
+            # Batch embedding: [text, cand1, cand2, ...]
+            # We filter out empty candidates to save compute, but need to map back to original indices
+            valid_cands_with_idx = [(c, i) for i, c in enumerate(candidates) if c and c.strip()]
+            
+            if valid_cands_with_idx:
+                texts_to_embed = [text] + [c for c, i in valid_cands_with_idx]
+                embeddings = list(embedder.embed_batch(texts_to_embed))
+                
+                if embeddings and len(embeddings) > 1:
+                    text_emb = embeddings[0]
+                    cand_embs = embeddings[1:]
+                    
+                    import numpy as np
+                    text_norm = np.linalg.norm(text_emb)
+                    
+                    if text_norm > 0:
+                        # Vectorized cosine similarity
+                        cand_matrix = np.array(cand_embs)
+                        cand_norms = np.linalg.norm(cand_matrix, axis=1)
+                        
+                        # Avoid division by zero
+                        cand_norms[cand_norms == 0] = 1e-10
+                        
+                        dot_products = np.dot(cand_matrix, text_emb)
+                        sims = dot_products / (cand_norms * text_norm)
+                        
+                        max_sim_idx = np.argmax(sims)
+                        max_sim = float(sims[max_sim_idx])
+                        
+                        if max_sim > embedding_score:
+                            embedding_score = max_sim
+                            # Map back to original index
+                            embedding_idx = valid_cands_with_idx[max_sim_idx][1]
+        except Exception as e:
+            logger.debug(f"Embedding calculation failed: {e}")
+            pass
+            
+    if embedding_score > best_score:
+        best_score = embedding_score
+        best_idx = embedding_idx
+
+    # 4. Vector Similarity (Legacy/Fallback)
+    if best_score < 0.9:
+        nlp = get_nlp_model()
+        vector_score = 0.0
+        vector_idx = -1
+        
+        if nlp and nlp.vocab.vectors.shape[0] > 0:
+            try:
+                doc = nlp(text)
+                if doc.vector_norm:
+                    for i, candidate in enumerate(candidates):
+                        if not candidate: continue
+                        cand_doc = nlp(candidate)
+                        if cand_doc.vector_norm:
+                            score = doc.similarity(cand_doc)
+                            if score > vector_score:
+                                vector_score = score
+                                vector_idx = i
+            except Exception:
+                pass
+        
+        if vector_score > best_score:
+            best_score = vector_score
+            best_idx = vector_idx
+
+    # 5. Fuzzy Match (Fallback)
+    if best_score < 0.9:
+        for i, cand in enumerate(candidates_lower):
+            if not cand: continue
+            score = difflib.SequenceMatcher(None, text_lower, cand).ratio()
+            if score > best_score:
+                best_score = score
+                best_idx = i
+                
+    return best_idx, float(best_score)
+
+
+def calculate_similarity(text: str, candidates: List[str]) -> float:
+    """
+    Calculate the maximum similarity between text and a list of candidates.
+    Wrapper around find_best_match_index.
+    """
+    _, score = find_best_match_index(text, candidates)
+    return score
+
+
+def match_entity(text: str, entities: List[Entity], threshold: float = 0.8) -> Optional[Entity]:
+    """
+    Find the best matching entity for the given text.
+    Uses optimized batch similarity matching.
+    """
+    if not text or not entities:
+        return None
+        
+    # Optimization: Check exact match first (case-insensitive)
+    text_lower = text.lower().strip()
+    for entity in entities:
+        if entity.text.lower().strip() == text_lower:
+            return entity
+
+    # Use batch matcher
+    candidates = [e.text for e in entities]
+    best_idx, best_score = find_best_match_index(text, candidates)
+    
+    if best_idx >= 0 and best_score >= threshold:
+        return entities[best_idx]
+        
+    return None
+
+
+def filter_entities_for_text(
+    text: str,
+    entities: List[Entity],
+    max_keep: int = 80,
+) -> List[Entity]:
+    if not text or not entities:
+        return []
+
+    if max_keep < 1:
+        return []
+
+    if len(entities) <= max_keep:
+        return entities
+
+    text_lower = text.lower()
+    stop_tokens = {
+        "inc",
+        "incorporated",
+        "corp",
+        "corporation",
+        "co",
+        "company",
+        "ltd",
+        "llc",
+        "plc",
+        "group",
+        "holdings",
+        "limited",
+        "the",
+        "and",
+        "or",
+        "of",
+        "in",
+        "on",
+        "at",
+        "for",
+        "to",
+        "a",
+        "an",
+    }
+
+    seen = set()
+    matched: List[Entity] = []
+    for entity in entities:
+        ent_text = getattr(entity, "text", "")
+        if not ent_text:
+            continue
+
+        key = ent_text.lower().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+
+        if key in text_lower:
+            matched.append(entity)
+            continue
+
+        tokens = re.findall(r"[a-z0-9]+", key)
+        keep = False
+        for tok in tokens:
+            if len(tok) < 2:
+                continue
+            if tok in stop_tokens:
+                continue
+            if tok in text_lower:
+                keep = True
+                break
+        if keep:
+            matched.append(entity)
+
+    if matched:
+        if len(matched) > max_keep:
+            matched.sort(key=lambda e: len(getattr(e, "text", "")), reverse=True)
+            return matched[:max_keep]
+        return matched
+
+    entities_sorted = sorted(entities, key=lambda e: len(getattr(e, "text", "")), reverse=True)
+    return entities_sorted[:max_keep]
+
+
+def calculate_weighted_confidence(
+    item_type: str, 
+    original_confidence: float, 
+    valid_types: Optional[List[str]] = None,
+    item_text: Optional[str] = None,
+    weight_method: float = 0.5,
+    weight_similarity: float = 0.5
+) -> float:
+    """
+    Calculate weighted confidence score using both Label and Content similarity.
+    Final Score = (weight_method * original_confidence) + (weight_similarity * max(label_sim, content_sim))
+    
+    Args:
+        item_type: The extracted type/label/predicate (e.g., "PERSON", "founded_by")
+        original_confidence: The confidence score from the extraction method (0.0-1.0)
+        valid_types: List of valid/preferred types provided by user
+        item_text: The actual text content extracted (e.g., "Steve Jobs", "acquired")
+        weight_method: Weight for the original method confidence (default 0.5)
+        weight_similarity: Weight for the similarity score (default 0.5)
+        
+    Returns:
+        float: Weighted confidence score (0.0-1.0)
+    """
+    if not valid_types:
+        return original_confidence
+        
+    # Similarity 1: Label vs Valid Types (e.g., "PERSON" vs "Artist")
+    label_similarity = calculate_similarity(item_type, valid_types)
+    
+    # Similarity 2: Content vs Valid Types (e.g., "Picasso" vs "Artist")
+    content_similarity = 0.0
+    if item_text:
+        content_similarity = calculate_similarity(item_text, valid_types)
+        
+    # Take the best similarity match
+    best_similarity = max(label_similarity, content_similarity)
+    
+    # Normalize weights
+    total_weight = weight_method + weight_similarity
+    if total_weight <= 0:
+        return original_confidence
+        
+    w_m = weight_method / total_weight
+    w_s = weight_similarity / total_weight
+    
+    final_score = (w_m * original_confidence) + (w_s * best_similarity)
+    
+    return max(0.0, min(1.0, final_score))
 
 
 # ============================================================================
@@ -137,8 +570,8 @@ def extract_entities_pattern(text: str, **kwargs) -> List[Entity]:
     entities = []
 
     patterns = {
-        "PERSON": r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b",
-        "ORG": r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\s+(?:Inc|Corp|LLC|Ltd|Company))\b",
+        "ORG": r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\s+(?:Inc|Corp|LLC|Ltd|Company)(?:\.|\b))",
+        "PERSON": r"\b([A-Z][a-z]+(?:\s+(?!Inc|Corp|LLC|Ltd|Company)[A-Z][a-z]+)+)\b",
         "GPE": r"\b([A-Z][a-z]+\s*(?:City|State|Country|Nation))\b",
         "DATE": r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4})\b",
     }
@@ -285,87 +718,454 @@ def extract_entities_huggingface(
     device: Optional[str] = None,
     **kwargs,
 ) -> List[Entity]:
-    """HuggingFace entity extraction."""
+    """
+    Extract entities using HuggingFace transformers.
+    
+    Args:
+        text: Input text
+        model: Model name or path
+        device: Device to use (cpu, cuda, mps)
+        **kwargs: Additional arguments passed to the pipeline (e.g., aggregation_strategy)
+    """
     loader = HuggingFaceModelLoader(device=device)
-    model_obj = loader.load_ner_model(model)
+    # Pass kwargs (like aggregation_strategy) to load_ner_model
+    model_obj = loader.load_ner_model(model, **kwargs)
     results = loader.extract_entities(model_obj, text)
 
     entities = []
-    for result in results:
-        if isinstance(result, dict):
-            entities.append(
-                Entity(
-                    text=result.get("word", result.get("entity", "")),
-                    label=result.get("entity_group", result.get("label", "UNKNOWN")),
-                    start_char=result.get("start", 0),
-                    end_char=result.get("end", 0),
-                    confidence=result.get("score", 1.0),
-                    metadata={"model": model, "extraction_method": "huggingface"},
+    
+    # Check if manual aggregation is needed (raw IOB tags detected)
+    needs_manual_aggregation = False
+    if results and isinstance(results[0], dict):
+        first_label = results[0].get("label", "")
+        # If we see B- tags and no entity_group (which implies aggregation wasn't done), we aggregate manually
+        if (first_label.startswith("B-") or first_label.startswith("I-")) and "entity_group" not in results[0]:
+            needs_manual_aggregation = True
+
+    if needs_manual_aggregation:
+        current_entity = None
+        for result in results:
+            label = result.get("label", "")
+            word = result.get("word", result.get("entity", ""))
+            score = result.get("score", 1.0)
+            start = result.get("start", 0)
+            end = result.get("end", 0)
+            
+            # Clean word (handle BERT ## and RoBERTa Ġ)
+            clean_word = word.replace("##", "").replace("Ġ", "")
+            if not clean_word:
+                continue
+
+            # Determine tag type and entity type
+            tag_prefix = label[:2] if len(label) > 2 else ""
+            entity_type = label[2:] if len(label) > 2 else label
+
+            if tag_prefix == "B-":
+                # Save previous entity
+                if current_entity:
+                    entities.append(current_entity)
+                
+                # Start new entity
+                current_entity = Entity(
+                    text=clean_word,
+                    label=entity_type,
+                    start_char=start,
+                    end_char=end,
+                    confidence=score,
+                    metadata={
+                        "model": model, 
+                        "extraction_method": "huggingface",
+                        "source": "huggingface",
+                        "raw_iob": True
+                    },
                 )
-            )
+            
+            elif tag_prefix == "I-" and current_entity:
+                # Check if type matches (loose check allows for some noise, strict check enforces type)
+                # We'll be lenient and allow continuation if it makes sense contextually, 
+                # but ideally types should match.
+                if current_entity.label == entity_type:
+                    # Append text
+                    # Use offsets to determine spacing
+                    if start > current_entity.end_char:
+                        # If there's a gap, add space (unless it was a subword that got split but has gap? Unlikely)
+                        # Usually gap means space.
+                        # However, for ## subwords, start usually equals end.
+                        # For Ġ, it implies space.
+                        current_entity.text += " " + clean_word
+                    else:
+                        current_entity.text += clean_word
+                    
+                    current_entity.end_char = end
+                    # Update confidence (average)
+                    current_entity.confidence = (current_entity.confidence + score) / 2
+                else:
+                    # Type mismatch - treat as new entity or ignore?
+                    # Treating as new B- is safer to avoid losing data
+                    if current_entity:
+                        entities.append(current_entity)
+                    
+                    current_entity = Entity(
+                        text=clean_word,
+                        label=entity_type,
+                        start_char=start,
+                        end_char=end,
+                        confidence=score,
+                        metadata={
+                            "model": model, 
+                            "extraction_method": "huggingface",
+                            "source": "huggingface",
+                            "raw_iob": True
+                        },
+                    )
+            
+            else:
+                # O tag or I- without B or other cases
+                if current_entity:
+                    entities.append(current_entity)
+                    current_entity = None
+        
+        # Append last entity
+        if current_entity:
+            entities.append(current_entity)
+
+    else:
+        # Standard processing for aggregated results or simple output
+        for result in results:
+            if isinstance(result, dict):
+                # Handle different output formats based on aggregation strategy
+                label = result.get("entity_group", result.get("label", "UNKNOWN"))
+                text_content = result.get("word", result.get("entity", ""))
+                
+                # Clean up text content (remove ## for subwords if raw)
+                if "##" in text_content and "aggregation_strategy" not in kwargs:
+                     text_content = text_content.replace("##", "")
+                if "Ġ" in text_content: # RoBERTa
+                     text_content = text_content.replace("Ġ", " ").strip()
+                     
+                entities.append(
+                    Entity(
+                        text=text_content,
+                        label=label,
+                        start_char=result.get("start", 0),
+                        end_char=result.get("end", 0),
+                        confidence=result.get("score", 1.0),
+                        metadata={
+                            "model": model, 
+                            "extraction_method": "huggingface",
+                            "source": "huggingface"
+                        },
+                    )
+                )
+            elif isinstance(result, list):
+                 # Handle list of lists (sometimes returned by pipeline)
+                 pass
 
     return entities
 
 
 def extract_entities_llm(
-    text: str, provider: str = "openai", model: Optional[str] = None, **kwargs
+    text: str,
+    provider: str = "openai",
+    model: Optional[str] = None,
+    silent_fail: bool = False,
+    max_text_length: Optional[int] = None,
+    structured_output_mode: str = "typed",
+    **kwargs,
 ) -> List[Entity]:
-    """LLM-based entity extraction."""
+    """
+    LLM-based entity extraction.
+    
+    Args:
+        text: Input text
+        provider: LLM provider
+        model: LLM model
+        silent_fail: If True, return empty list on error. If False (default), raise exception.
+        max_text_length: Maximum text length before auto-chunking. None = provider default.
+        **kwargs: Additional options
+    """
     # Support llm_model parameter to disambiguate from ML model
     if "llm_model" in kwargs:
         model = kwargs.pop("llm_model")
+    
+    # Check cache
+    cache_params = {
+        "provider": provider,
+        "model": model,
+        "max_text_length": max_text_length,
+        "structured_output_mode": structured_output_mode,
+        "entity_types": kwargs.get("entity_types"),
+    }
+    cached_result = _result_cache.get("entities", text, **cache_params)
+    if cached_result:
+        logger.debug(f"Cache hit for entity extraction ({len(cached_result)} entities)")
+        return cached_result
+    
+    # 1. PRE-EXTRACTION VALIDATION
+    if not text or not text.strip():
+        error_msg = "Text is empty or whitespace only"
+        logger.error(error_msg)
+        if not silent_fail:
+            raise ProcessingError(error_msg)
+        return []
 
-    llm = create_provider(provider, model=model, **kwargs)
+    # Pass api_key if provided in kwargs (needed for all providers)
+    provider_kwargs = kwargs.copy()
+    if "api_key" not in provider_kwargs or not provider_kwargs["api_key"]:
+        # Try to get from environment as fallback for all providers
+        import os
+        env_key = f"{provider.upper()}_API_KEY"
+        api_key = os.getenv(env_key)
+        if api_key:
+            provider_kwargs["api_key"] = api_key
 
-    if not llm.is_available():
-        raise ProcessingError(f"{provider} provider not available")
+    # 2. PROVIDER VALIDATION
+    try:
+        llm = create_provider(provider, model=model, **provider_kwargs)
+        if not llm.is_available():
+            error_msg = f"{provider} provider not available. Check API key and dependencies."
+            logger.error(error_msg)
+            if not silent_fail:
+                raise ProcessingError(error_msg)
+            return []
+    except Exception as e:
+        error_msg = f"Failed to create {provider} provider: {e}"
+        logger.error(error_msg)
+        if not silent_fail:
+            raise ProcessingError(error_msg) from e
+        return []
 
-    prompt = f"""Extract named entities from the following text. 
-Return JSON format: [{{"text": "...", "label": "PERSON|ORG|GPE|DATE|...", "start": 0, "end": 10}}]
+    # 3. TEXT LENGTH CHECK AND CHUNKING
+    if max_text_length is None:
+        # Provider-specific defaults
+        max_text_length = {
+            "groq": 64000,
+            "openai": 64000,
+            "gemini": 64000,
+            "anthropic": 64000,
+            "deepseek": 64000,
+        }.get(provider.lower(), 32000)
+    
+    if len(text) > max_text_length:
+        logger.info(f"Text length ({len(text)}) exceeds limit ({max_text_length}). Chunking...")
+        return _extract_entities_chunked(
+            text, 
+            provider=provider, 
+            model=model, 
+            silent_fail=silent_fail,
+            max_text_length=max_text_length,
+            **kwargs
+        )
 
-Text: {text}"""
+    # Use custom entity types if provided, otherwise use defaults
+    entity_types = kwargs.get("entity_types")
+    if entity_types:
+        entity_types_str = ", ".join(entity_types)
+        entity_types_instruction = f"""Preferred entity types: {entity_types_str}.
+You may also use related or similar entity types if they better match the context (e.g., variations, synonyms, or domain-specific types).
+If an entity doesn't fit any of the preferred types, use the most appropriate type from the preferred list or a closely related type."""
+    else:
+        entity_types_instruction = """Entity types should be one of: 
+- PERSON (People, names, roles)
+- ORG (Companies, organizations, institutions, brands)
+- GPE (Countries, cities, states, locations)
+- DATE (Dates, years, time periods)
+- EVENT (Named events, conferences)
+- PRODUCT (Software, hardware, vehicles)
+- CONCEPT (Abstract ideas, technologies)
+
+Use the most appropriate type for each entity.
+Examples:
+- 'Microsoft' is an ORG
+- 'Satya Nadella' is a PERSON
+- Job titles/roles like 'CEO', 'CTO', 'President', 'Engineer' are CONCEPT unless part of a person's name
+- 'Python' is a PRODUCT or CONCEPT depending on context."""
+
+    if not SCHEMAS_AVAILABLE:
+        raise ImportError("Pydantic schemas not available. Install pydantic/instructor to use LLM extraction.")
 
     try:
-        result = llm.generate_structured(prompt)
+        prompt = f"""Extract named entities from the provided text.
+Return the result as a JSON object with an "entities" key containing the list of entities.
+Each entity should have 'text', 'label', and 'confidence' fields.
+
+IMPORTANT: 
+- Return a FLAT LIST of entities. 
+- DO NOT group entities by type.
+- The output structure must exactly match: {{ "entities": [ {{ "text": "...", "label": "...", "confidence": ... }}, ... ] }}
+
+Example output (JSON format only):
+{{
+  "entities": [
+    {{"text": "Entity Name", "label": "CATEGORY", "confidence": 0.95}},
+    {{"text": "Another Entity", "label": "OTHER_CATEGORY", "confidence": 0.90}}
+  ]
+}}
+
+Instructions:
+1. Extract entities ONLY from the text provided below.
+2. Do not include any entities from the example above.
+3. {entity_types_instruction}
+
+Text to extract from:
+{text}"""
+        
+        # Use typed generation with Pydantic schema
+        result_obj = llm.generate_typed(prompt, schema=EntitiesResponse, **kwargs)
+        
+        # Convert back to internal Entity format
         entities = []
-
-        if isinstance(result, list):
-            for item in result:
-                entities.append(
-                    Entity(
-                        text=item.get("text", ""),
-                        label=item.get("label", "UNKNOWN"),
-                        start_char=item.get("start", 0),
-                        end_char=item.get("end", 0),
-                        confidence=item.get("confidence", 0.9),
-                        metadata={
-                            "provider": provider,
-                            "model": model,
-                            "extraction_method": "llm",
-                        },
-                    )
-                )
-        elif isinstance(result, dict) and "entities" in result:
-            for item in result["entities"]:
-                entities.append(
-                    Entity(
-                        text=item.get("text", ""),
-                        label=item.get("label", "UNKNOWN"),
-                        start_char=item.get("start", 0),
-                        end_char=item.get("end", 0),
-                        confidence=item.get("confidence", 0.9),
-                        metadata={
-                            "provider": provider,
-                            "model": model,
-                            "extraction_method": "llm",
-                        },
-                    )
-                )
-
+        for e_out in result_obj.entities:
+            entities.append(Entity(
+                text=e_out.text,
+                label=e_out.label,
+                start_char=e_out.start if hasattr(e_out, "start") else 0, # Schema might not force these
+                end_char=e_out.end if hasattr(e_out, "end") else 0,
+                confidence=e_out.confidence,
+                metadata={
+                    "provider": provider, 
+                    "model": model, 
+                    "extraction_method": "llm_typed",
+                }
+            ))
+        
+        logger.info(f"Successfully extracted {len(entities)} entities using {provider}/{model} (typed)")
+        _result_cache.set("entities", text, entities, **cache_params)
         return entities
+        
     except Exception as e:
-        logger.error(f"LLM entity extraction failed: {e}")
+        # Check for length/token limit errors
+        error_msg_str = str(e).lower()
+        if "length" in error_msg_str or "max_tokens" in error_msg_str:
+            logger.warning(f"LLM output truncated due to length limit. Reducing chunk size and retrying... ({e})")
+            
+            # Determine new chunk size (halve it)
+            current_max = max_text_length or len(text)
+            new_max = current_max // 2
+            
+            if new_max > 100: # Minimum viable chunk size check
+                return _extract_entities_chunked(
+                    text, 
+                    provider=provider, 
+                    model=model, 
+                    silent_fail=silent_fail, 
+                    max_text_length=new_max,
+                    **kwargs
+                )
+
+        error_msg = f"LLM entity extraction failed ({provider}/{model}): {e}"
+        logger.error(error_msg, exc_info=True)
+        if not silent_fail:
+            if isinstance(e, ProcessingError):
+                raise
+            raise ProcessingError(error_msg) from e
         return []
+
+
+def _parse_entity_result(result: Any, provider: str, model: Optional[str]) -> List[Entity]:
+    """Helper to parse raw LLM result into Entity objects."""
+    entities = []
+    items = []
+    
+    if isinstance(result, list):
+        items = result
+    elif isinstance(result, dict):
+        # Handle cases where LLM wraps the list in a key
+        for key in ["entities", "data", "results"]:
+            if key in result and isinstance(result[key], list):
+                items = result[key]
+                break
+        if not items and "text" in result: # Single object instead of list
+            items = [result]
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+            
+        text = item.get("text", "")
+        if not text:
+            continue
+            
+        entities.append(
+            Entity(
+                text=text,
+                label=item.get("label", "UNKNOWN"),
+                start_char=item.get("start", 0),
+                end_char=item.get("end", 0),
+                confidence=item.get("confidence", 0.9),
+                metadata={
+                    "provider": provider,
+                    "model": model,
+                    "extraction_method": "llm",
+                },
+            )
+        )
+    return entities
+
+
+def _extract_entities_chunked(
+    text: str,
+    provider: str,
+    model: Optional[str],
+    silent_fail: bool,
+    max_text_length: int,
+    structured_output_mode: str = "typed",
+    **kwargs
+) -> List[Entity]:
+    """Internal helper to extract entities from long text by chunking."""
+    from ..split import TextSplitter
+    
+    splitter = TextSplitter(
+        method="recursive",
+        chunk_size=max_text_length,
+        chunk_overlap=int(max_text_length * 0.1) # 10% overlap
+    )
+    chunks = splitter.split(text)
+    
+    all_entities = []
+    
+    from .config import resolve_max_workers
+    max_workers = resolve_max_workers(explicit=kwargs.get("max_workers"))
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_chunk = {}
+        for i, chunk in enumerate(chunks):
+            logger.debug(f"Scheduling entity extraction for chunk {i+1}/{len(chunks)}")
+            # We recursively call extract_entities_llm with the chunk
+            # but ensure we don't trigger re-chunking by setting max_text_length large
+            future = executor.submit(
+                extract_entities_llm,
+                chunk.text,
+                provider=provider,
+                model=model,
+                silent_fail=False, # We want to know if a chunk fails
+                max_text_length=len(chunk.text) + 1,
+                structured_output_mode=structured_output_mode,
+                **kwargs
+            )
+            future_to_chunk[future] = (i, chunk)
+            
+        for future in as_completed(future_to_chunk):
+            i, chunk = future_to_chunk[future]
+            try:
+                chunk_entities = future.result()
+                
+                # Adjust entity positions to account for chunk offset
+                for entity in chunk_entities:
+                    entity.start_char += chunk.start_index
+                    entity.end_char += chunk.start_index
+                    all_entities.append(entity)
+                    
+            except Exception as e:
+                if not silent_fail:
+                    logger.error(f"Chunk {i+1} failed: {e}")
+                    raise
+                logger.warning(f"Chunk {i+1} failed (silent): {e}")
+
+    return all_entities
+
+
+
 
 
 # ============================================================================
@@ -403,17 +1203,17 @@ def extract_relations_pattern(
 
     relation_patterns = {
         "founded_by": [
-            fr"(?P<subject>{subject_pat})\s+(?:was\s+)?founded\s+by\s+(?P<object>{ent_pat})",
-            fr"(?P<object>{ent_pat})\s+founded\s+(?P<subject>{ent_pat})",
-            fr"(?P<subject>{subject_pat})\s+(?:was\s+)?established\s+by\s+(?P<object>{ent_pat})",
-            fr"(?P<object>{ent_pat})\s+established\s+(?P<subject>{ent_pat})",
-            fr"(?P<subject>{subject_pat})\s+(?:was\s+)?created\s+by\s+(?P<object>{ent_pat})",
-            fr"(?P<object>{ent_pat})\s+created\s+(?P<subject>{ent_pat})",
-            fr"(?P<subject>{subject_pat})\s+(?:was\s+)?started\s+by\s+(?P<object>{ent_pat})",
-            fr"(?P<object>{ent_pat})\s+started\s+(?P<subject>{ent_pat})",
-            fr"(?P<subject>{subject_pat})\s+(?:was\s+)?co-founded\s+by\s+(?P<object>{ent_pat})",
-            fr"(?P<object>{ent_pat})\s+co-founded\s+(?P<subject>{ent_pat})",
-            fr"(?P<object>{ent_pat})\s+is\s+(?:the\s+)?founder\s+of\s+(?P<subject>{ent_pat})",
+            fr"(?P<subject>{subject_pat})(?:[.,])?\s+(?:was\s+)?founded\s+by\s+(?P<object>{ent_pat})",
+            fr"(?P<object>{ent_pat})(?:[.,])?\s+founded\s+(?P<subject>{ent_pat})",
+            fr"(?P<subject>{subject_pat})(?:[.,])?\s+(?:was\s+)?established\s+by\s+(?P<object>{ent_pat})",
+            fr"(?P<object>{ent_pat})(?:[.,])?\s+established\s+(?P<subject>{ent_pat})",
+            fr"(?P<subject>{subject_pat})(?:[.,])?\s+(?:was\s+)?created\s+by\s+(?P<object>{ent_pat})",
+            fr"(?P<object>{ent_pat})(?:[.,])?\s+created\s+(?P<subject>{ent_pat})",
+            fr"(?P<subject>{subject_pat})(?:[.,])?\s+(?:was\s+)?started\s+by\s+(?P<object>{ent_pat})",
+            fr"(?P<object>{ent_pat})(?:[.,])?\s+started\s+(?P<subject>{ent_pat})",
+            fr"(?P<subject>{subject_pat})(?:[.,])?\s+(?:was\s+)?co-founded\s+by\s+(?P<object>{ent_pat})",
+            fr"(?P<object>{ent_pat})(?:[.,])?\s+co-founded\s+(?P<subject>{ent_pat})",
+            fr"(?P<object>{ent_pat})(?:[.,])?\s+is\s+(?:the\s+)?founder\s+of\s+(?P<subject>{ent_pat})",
         ],
         "located_in": [
             fr"(?P<subject>{subject_pat})\s+is\s+located\s+in\s+(?P<object>{ent_pat})",
@@ -450,26 +1250,16 @@ def extract_relations_pattern(
     }
 
     entity_map = {e.text.lower(): e for e in entities}
-    # DEBUG: Print entities in map
-    print(f"DEBUG: Entity map keys: {list(entity_map.keys())}")
 
     for relation_type, patterns in relation_patterns.items():
         for pattern in patterns:
-            # DEBUG: Print pattern being tried
-            # print(f"DEBUG: Trying pattern: {pattern}")
             for match in re.finditer(pattern, text, re.IGNORECASE):
                 subject_text = match.group("subject").strip()
                 object_text = match.group("object").strip()
                 
-                # DEBUG: Print match details
-                print(f"DEBUG: Match found! Subject='{subject_text}', Object='{object_text}'")
-
                 subject_entity = entity_map.get(subject_text.lower())
                 object_entity = entity_map.get(object_text.lower())
                 
-                # DEBUG: Print lookup results
-                print(f"DEBUG: Subject Entity found: {subject_entity is not None}, Object Entity found: {object_entity is not None}")
-
                 if subject_entity and object_entity:
                     start = max(0, match.start() - 50)
                     end = min(len(text), match.end() + 50)
@@ -562,6 +1352,127 @@ def extract_relations_cooccurrence(
                         metadata={
                             "extraction_method": "co_occurrence",
                             "distance": distance,
+                        },
+                    )
+                )
+
+    return relations
+
+
+def extract_relations_similarity(
+    text: str, entities: List[Entity], relation_types: Optional[List[str]] = None, **kwargs
+) -> List[Relation]:
+    """
+    Similarity-based relation extraction.
+    Uses semantic similarity to match the context between entities to provided relation types.
+    """
+    if not entities:
+        return []
+
+    # If no relation types provided, we can't do similarity matching against types
+    if not relation_types:
+        # Fallback to co-occurrence if no types to match against
+        logger.warning("No relation types provided for similarity matching. Falling back to co-occurrence.")
+        return extract_relations_cooccurrence(text, entities, **kwargs)
+
+    relations = []
+    
+    # Try to load spaCy model with vectors
+    nlp = None
+    if SPACY_AVAILABLE:
+        try:
+            # Prefer larger models for vectors
+            for model_name in ["en_core_web_lg", "en_core_web_md", "en_core_web_sm"]:
+                if spacy.util.is_package(model_name):
+                    nlp = spacy.load(model_name)
+                    break
+            if not nlp:
+                 # Try loading what we have
+                 try:
+                     nlp = spacy.load("en_core_web_sm") 
+                 except:
+                     pass
+        except Exception:
+            pass
+
+    # Pre-compute relation type vectors if possible
+    relation_vectors = {}
+    has_vectors = False
+    if nlp:
+        # Check if model has vectors
+        if nlp.vocab.vectors.shape[0] > 0:
+            has_vectors = True
+            for rt in relation_types:
+                relation_vectors[rt] = nlp(rt)
+    
+    for entity1 in entities:
+        for entity2 in entities:
+            if entity1 == entity2:
+                continue
+                
+            # Check distance
+            distance = abs(entity1.end_char - entity2.start_char)
+            # Only consider entities reasonably close (e.g., within same sentence or clause)
+            if distance > 100: 
+                continue
+
+            # Ensure correct order for extracting text between
+            if entity1.end_char < entity2.start_char:
+                start_pos = entity1.end_char
+                end_pos = entity2.start_char
+            else:
+                start_pos = entity2.end_char
+                end_pos = entity1.start_char
+                
+            between_text = text[start_pos:end_pos].strip()
+            
+            if not between_text:
+                continue
+
+            # Calculate similarity
+            best_type = None
+            best_score = 0.0
+
+            if has_vectors and relation_vectors:
+                # Vector similarity
+                doc = nlp(between_text)
+                if doc.vector_norm:
+                    for rt, vec in relation_vectors.items():
+                        if vec.vector_norm:
+                            sim = doc.similarity(vec)
+                            if sim > best_score:
+                                best_score = sim
+                                best_type = rt
+            else:
+                # String similarity / Keyword matching
+                from difflib import SequenceMatcher
+                for rt in relation_types:
+                    # Check for direct keyword presence (strong signal)
+                    if rt.lower() in between_text.lower():
+                        score = 1.0
+                    else:
+                        # Fuzzy match
+                        score = SequenceMatcher(None, rt.lower(), between_text.lower()).ratio()
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_type = rt
+
+            # Threshold
+            threshold = kwargs.get("similarity_threshold", 0.4 if has_vectors else 0.6)
+            
+            if best_type and best_score >= threshold:
+                relations.append(
+                    Relation(
+                        subject=entity1,
+                        predicate=best_type,
+                        object=entity2,
+                        confidence=float(best_score),
+                        context=text[max(0, min(entity1.start_char, entity2.start_char) - 20) : min(len(text), max(entity1.end_char, entity2.end_char) + 20)],
+                        metadata={
+                            "extraction_method": "similarity",
+                            "similarity_score": float(best_score),
+                            "between_text": between_text
                         },
                     )
                 )
@@ -708,14 +1619,26 @@ def extract_relations_huggingface(
 ) -> List[Relation]:
     """HuggingFace relation extraction."""
     loader = HuggingFaceModelLoader(device=device)
-    model_obj = loader.load_relation_model(model)
+    model_obj = loader.load_relation_model(model, **kwargs)
 
-    # This is simplified - actual implementation would depend on model architecture
-    results = loader.extract_relations(model_obj, text, entities)
+    # Pass kwargs (e.g. threshold)
+    results = loader.extract_relations(model_obj, text, entities, **kwargs)
 
     relations = []
-    # Parse results based on model output format
-    # This is a placeholder - actual parsing would depend on the model
+    for result in results:
+        relations.append(
+            Relation(
+                subject=result["subject"],
+                predicate=result["relation"],
+                object=result["object"],
+                confidence=result.get("score", 1.0),
+                context=text,
+                metadata={
+                    "model": model,
+                    "extraction_method": "huggingface"
+                }
+            )
+        )
     return relations
 
 
@@ -724,60 +1647,403 @@ def extract_relations_llm(
     entities: List[Entity],
     provider: str = "openai",
     model: Optional[str] = None,
+    silent_fail: bool = False,
+    max_text_length: Optional[int] = None,
+    structured_output_mode: str = "typed",
+    max_retries: int = 3,
     **kwargs,
 ) -> List[Relation]:
-    """LLM-based relation extraction."""
-    llm = create_provider(provider, model=model, **kwargs)
+    """
+    LLM-based relation extraction.
+    
+    Args:
+        text: Input text
+        entities: Pre-extracted entities
+        provider: LLM provider
+        model: LLM model
+        silent_fail: If True, return empty list on error. If False (default), raise exception.
+        max_text_length: Maximum text length before auto-chunking. None = provider default.
+        max_retries: Maximum number of retries for LLM calls (default: 3)
+        **kwargs: Additional options
+    """
+    # Support llm_model parameter to disambiguate from ML model
+    if "llm_model" in kwargs:
+        model = kwargs.pop("llm_model")
+    
+    # Check cache
+    cache_params = {
+        "provider": provider,
+        "model": model,
+        "max_text_length": max_text_length,
+        "structured_output_mode": structured_output_mode,
+        "max_retries": max_retries,
+        "relation_types": kwargs.get("relation_types"),
+        # Include entities hash/str in cache key implicitly via **cache_params
+        "entities_hash": hash(tuple(sorted([e.text for e in entities]))) if entities else 0
+    }
+    cached_result = _result_cache.get("relations", text, **cache_params)
+    if cached_result:
+        logger.debug(f"Cache hit for relation extraction ({len(cached_result)} relations)")
+        return cached_result
+    
+    # 1. PRE-EXTRACTION VALIDATION
+    if not text or not text.strip():
+        error_msg = "Text is empty or whitespace only"
+        logger.error(error_msg)
+        if not silent_fail:
+            raise ProcessingError(error_msg)
+        return []
 
-    if not llm.is_available():
-        raise ProcessingError(f"{provider} provider not available")
+    if not entities:
+        error_msg = "No entities provided for relation extraction. Relations require existing entities."
+        logger.error(error_msg)
+        if not silent_fail:
+            raise ProcessingError(error_msg)
+        return []
 
-    entities_str = ", ".join([f"{e.text} ({e.label})" for e in entities])
-    prompt = f"""Extract relations between entities from the following text.
+    # Pass api_key if provided in kwargs
+    provider_kwargs = kwargs.copy()
+    
+    # Check if api_key is provided but empty, or not provided at all
+    if "api_key" not in provider_kwargs or not provider_kwargs["api_key"]:
+        import os
+        env_key = f"{provider.upper()}_API_KEY"
+        api_key = os.getenv(env_key)
+        if api_key:
+            provider_kwargs["api_key"] = api_key
+            
+    # Remove None/empty API key if still present to avoid provider errors
+    if "api_key" in provider_kwargs and not provider_kwargs["api_key"]:
+        del provider_kwargs["api_key"]
 
-Text: {text}
-Entities: {entities_str}
+    # 2. PROVIDER VALIDATION
+    try:
+        llm = create_provider(provider, model=model, **provider_kwargs)
+        if not llm.is_available():
+            error_msg = f"{provider} provider not available for relation extraction (key missing?)."
+            logger.error(error_msg)
+            if not silent_fail:
+                raise ProcessingError(error_msg)
+            return []
+    except Exception as e:
+        error_msg = f"Failed to create {provider} provider for relations: {e}"
+        logger.error(error_msg)
+        if not silent_fail:
+            raise ProcessingError(error_msg) from e
+        return []
 
-Return JSON format: [{{"subject": "...", "predicate": "...", "object": "...", "confidence": 0.9}}]"""
+    # 3. TEXT LENGTH CHECK AND CHUNKING
+    if max_text_length is None:
+        # Default limits for chunking only - NOT for LLM generation
+        max_text_length = {
+            "groq": 64000,
+            "openai": 64000,
+            "gemini": 64000,
+            "anthropic": 64000,
+            "deepseek": 64000,
+        }.get(provider.lower(), 32000)
+    
+    if len(text) > max_text_length:
+        logger.info(f"Text length ({len(text)}) exceeds limit for relations. Chunking...")
+        return _extract_relations_chunked(
+            text, entities, provider=provider, model=model, 
+            silent_fail=silent_fail, max_text_length=max_text_length, 
+            max_retries=max_retries,
+            **kwargs
+        )
+
+    original_entities = entities
+    # Use a fixed internal default for prompt entity cap (do not accept overrides from kwargs)
+    max_entities_prompt = 80
+    prompt_entities = original_entities
+    if max_entities_prompt > 0 and len(original_entities) > max_entities_prompt:
+        prompt_entities = filter_entities_for_text(
+            text,
+            original_entities,
+            max_keep=max_entities_prompt,
+        )
+
+    entities_str = ", ".join([f"{e.text} ({e.label})" for e in prompt_entities])
+    
+    # Use custom relation types if provided
+    relation_types = kwargs.get("relation_types")
+    if relation_types:
+        relation_types_str = ", ".join(relation_types)
+        relation_types_instruction = f"""
+Preferred relation types: {relation_types_str}.
+You may also use related or similar relation types if they better capture the relationship (e.g., variations, synonyms, or domain-specific relations).
+If a relation doesn't fit any of the preferred types, use the most appropriate type from the preferred list or a closely related type that accurately describes the relationship."""
+    else:
+        relation_types_instruction = """
+Extract meaningful relationships between entities. Use appropriate relation types that accurately describe how entities are connected.
+Common relation types include: related_to, part_of, located_in, created_by, uses, depends_on, interacts_with, and similar variations."""
+    
+    verbose_mode = kwargs.get("verbose", False)
+    if verbose_mode:
+        import sys
+        print(f"    [methods.extract_relations_llm] Constructing prompt for {len(prompt_entities)} entities...", flush=True, file=sys.stdout)
+    
+    if not SCHEMAS_AVAILABLE:
+        raise ImportError("Pydantic schemas not available. Install pydantic/instructor to use LLM extraction.")
+
+    prompt = f"""Extract relations between entities from the provided text.
+Return the result as a JSON object with a "relations" key containing the list of relations.
+Each relation must have 'subject', 'predicate', and 'object' fields.
+
+Example output (JSON format only):
+{{
+  "relations": [
+    {{"subject": "Entity A", "predicate": "related_to", "object": "Entity B", "confidence": 0.95}},
+    {{"subject": "Subject Entity", "predicate": "action_verb", "object": "Object Entity", "confidence": 0.90}}
+  ]
+}}
+
+Instructions:
+1. Extract relations ONLY from the text provided below.
+2. Do not include any relations from the example above.
+3. Use the provided entities list as a reference for subjects and objects.
+4. {relation_types_instruction}
+
+Text to extract from:
+{text}
+Entities found in text: {entities_str}"""
 
     try:
-        result = llm.generate_structured(prompt)
-        relations = []
+        # Use typed generation with Pydantic schema
+        # Pass kwargs to allow max_tokens and other parameters to be used
+        if verbose_mode:
+             import sys
+             print(f"    [methods.extract_relations_llm] Calling llm.generate_typed ({provider}/{model})...", flush=True, file=sys.stdout)
+        # Only forward minimal, safe parameters to provider calls
+        call_kwargs = {}
+        if "temperature" in kwargs:
+            call_kwargs["temperature"] = kwargs["temperature"]
+        if "verbose" in kwargs:
+            call_kwargs["verbose"] = kwargs["verbose"]
+        
+        call_kwargs["max_retries"] = max_retries
 
-        if isinstance(result, list):
-            for item in result:
-                # Find matching entities
-                subject_text = item.get("subject", "")
-                object_text = item.get("object", "")
+        result_obj = llm.generate_typed(prompt, schema=RelationsResponse, **call_kwargs)
+        if verbose_mode:
+             import sys
+             print(f"    [methods.extract_relations_llm] Received response from {provider}.", flush=True, file=sys.stdout)
+        
+        # Convert back to internal Relation format (robust across providers)
+        # Normalize typed result to a plain dict compatible with _parse_relation_result
+        try:
+            if hasattr(result_obj, "model_dump"):
+                parsed = result_obj.model_dump()
+            elif isinstance(result_obj, dict):
+                parsed = result_obj
+            elif hasattr(result_obj, "relations"):
+                # Instructor may return objects for each relation; convert where possible
+                rel_items = []
+                for r in getattr(result_obj, "relations", []):
+                    if hasattr(r, "model_dump"):
+                        rel_items.append(r.model_dump())
+                    elif isinstance(r, dict):
+                        rel_items.append(r)
+                    else:
+                        # Best-effort attribute access
+                        rel_items.append({
+                            "subject": getattr(r, "subject", ""),
+                            "object": getattr(r, "object", ""),
+                            "predicate": getattr(r, "predicate", "related_to"),
+                            "confidence": getattr(r, "confidence", 0.9),
+                        })
+                parsed = {"relations": rel_items}
+            else:
+                parsed = result_obj
+        except Exception:
+            parsed = result_obj
 
-                subject_entity = next(
-                    (e for e in entities if e.text.lower() == subject_text.lower()),
-                    None,
-                )
-                object_entity = next(
-                    (e for e in entities if e.text.lower() == object_text.lower()), None
-                )
+        # Use common parser to build internal Relation objects
+        relations = _parse_relation_result(parsed, original_entities, text, provider, model)
+        
+        # If typed path returned no relations, attempt a structured JSON fallback
+        if not relations:
+            try:
+                if verbose_mode:
+                    import sys
+                    print("    [methods.extract_relations_llm] Typed result empty, attempting structured JSON fallback...", flush=True, file=sys.stdout)
+                raw_json = llm.generate_structured(prompt, **call_kwargs)
+                relations = _parse_relation_result(raw_json, original_entities, text, provider, model)
+            except Exception as _e:
+                # Keep relations as empty if fallback fails
+                pass
 
-                if subject_entity and object_entity:
-                    relations.append(
-                        Relation(
-                            subject=subject_entity,
-                            predicate=item.get("predicate", "related_to"),
-                            object=object_entity,
-                            confidence=item.get("confidence", 0.9),
-                            context=text,
-                            metadata={
-                                "provider": provider,
-                                "model": model,
-                                "extraction_method": "llm",
-                            },
-                        )
-                    )
-
+        logger.info(f"Successfully extracted {len(relations)} relations using {provider}/{model} (typed)")
+        _result_cache.set("relations", text, relations, **cache_params)
         return relations
+        
     except Exception as e:
-        logger.error(f"LLM relation extraction failed: {e}")
+        # Check for length/token limit errors
+        error_msg_str = str(e).lower()
+        if "length" in error_msg_str or "max_tokens" in error_msg_str:
+            logger.warning(f"LLM output truncated due to length limit. Reducing chunk size and retrying... ({e})")
+            
+            # Determine new chunk size (halve it)
+            current_max = max_text_length or len(text)
+            new_max = current_max // 2
+            
+            if new_max > 100: # Minimum viable chunk size check
+                return _extract_relations_chunked(
+                    text, entities, provider=provider, model=model,
+                    silent_fail=silent_fail, max_text_length=new_max,
+                    structured_output_mode=structured_output_mode,
+                    **kwargs
+                )
+
+        error_msg = f"LLM relation extraction failed ({provider}/{model}): {e}"
+        logger.error(error_msg, exc_info=True)
+        if not silent_fail:
+            if isinstance(e, ProcessingError):
+                raise
+            raise ProcessingError(error_msg) from e
         return []
+
+
+def _parse_relation_result(
+    result: Any, 
+    entities: List[Entity], 
+    text: str,
+    provider: str, 
+    model: Optional[str]
+) -> List[Relation]:
+    """Helper to parse raw LLM result into Relation objects."""
+    relations = []
+    items = []
+    
+    if isinstance(result, list):
+        items = result
+    elif isinstance(result, dict):
+        for key in ["relations", "data", "results"]:
+            if key in result and isinstance(result[key], list):
+                items = result[key]
+                break
+        if not items and "subject" in result:
+            items = [result]
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+            
+        subject_text = item.get("subject", "")
+        object_text = item.get("object", "")
+        
+        if not subject_text or not object_text:
+            continue
+            
+        # Ensure they are strings
+        subject_text = str(subject_text)
+        object_text = str(object_text)
+
+        # Find matching entities using hybrid similarity; fall back to a
+        # synthetic entity so multi-value results are never silently dropped.
+        subject_entity = match_entity(subject_text, entities)
+        object_entity = match_entity(object_text, entities)
+
+        if not subject_entity:
+            subject_entity = Entity(
+                text=subject_text, label="UNKNOWN",
+                start_char=0, end_char=len(subject_text),
+                confidence=0.8, metadata={"synthetic": True},
+            )
+        if not object_entity:
+            object_entity = Entity(
+                text=object_text, label="UNKNOWN",
+                start_char=0, end_char=len(object_text),
+                confidence=0.8, metadata={"synthetic": True},
+            )
+
+        relations.append(
+            Relation(
+                subject=subject_entity,
+                predicate=item.get("predicate", "related_to"),
+                object=object_entity,
+                confidence=item.get("confidence", 0.9),
+                context=text,
+                metadata={
+                    "provider": provider,
+                    "model": model,
+                    "extraction_method": "llm",
+                },
+            )
+        )
+    return relations
+
+
+def _extract_relations_chunked(
+    text: str,
+    entities: List[Entity],
+    provider: str,
+    model: Optional[str],
+    silent_fail: bool,
+    max_text_length: int,
+    structured_output_mode: str = "typed",
+    max_retries: int = 3,
+    **kwargs
+) -> List[Relation]:
+    """Internal helper to extract relations from long text by chunking."""
+    from ..split import TextSplitter
+    
+    splitter = TextSplitter(
+        method="recursive",
+        chunk_size=max_text_length,
+        chunk_overlap=int(max_text_length * 0.1)
+    )
+    chunks = splitter.split(text)
+    
+    all_relations = []
+    
+    from .config import resolve_max_workers
+    max_workers = resolve_max_workers(explicit=kwargs.get("max_workers"))
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_chunk = {}
+        for i, chunk in enumerate(chunks):
+            # Only include entities that appear in this chunk (or close to it)
+            chunk_entities = [
+                e for e in entities 
+                if e.start_char >= chunk.start_index - 100 and e.end_char <= chunk.end_index + 100
+            ]
+            
+            if not chunk_entities:
+                continue
+                
+            logger.debug(f"Scheduling relation extraction for chunk {i+1}/{len(chunks)} with {len(chunk_entities)} entities")
+            
+            # Only pass minimal kwargs downstream
+            limited_kwargs = {k: kwargs[k] for k in ("relation_types", "temperature", "verbose") if k in kwargs}
+            future = executor.submit(
+                extract_relations_llm,
+                chunk.text,
+                entities=chunk_entities,
+                provider=provider,
+                model=model,
+                silent_fail=False,
+                max_text_length=len(chunk.text) + 1,
+                structured_output_mode=structured_output_mode,
+                max_retries=max_retries,
+                **limited_kwargs
+            )
+            future_to_chunk[future] = i
+            
+        for future in as_completed(future_to_chunk):
+            i = future_to_chunk[future]
+            try:
+                chunk_rels = future.result()
+                all_relations.extend(chunk_rels)
+            except Exception as e:
+                if not silent_fail:
+                    logger.error(f"Chunk {i+1} failed: {e}")
+                    raise
+                logger.warning(f"Chunk {i+1} failed (silent): {e}")
+        
+    return all_relations
+
+
+
 
 
 # ============================================================================
@@ -815,12 +2081,8 @@ def extract_triplets_pattern(
             predicate_text = match.group("predicate")
             object_text = match.group("object")
 
-            subject_entity = next(
-                (e for e in entities if e.text.lower() == subject_text.lower()), None
-            )
-            object_entity = next(
-                (e for e in entities if e.text.lower() == object_text.lower()), None
-            )
+            subject_entity = match_entity(subject_text, entities)
+            object_entity = match_entity(object_text, entities)
 
             if subject_entity and object_entity:
                 triplets.append(
@@ -882,16 +2144,46 @@ def extract_triplets_huggingface(
 ) -> List[Triplet]:
     """HuggingFace triplet extraction."""
     loader = HuggingFaceModelLoader(device=device)
-    model_obj = loader.load_triplet_model(model)
-    results = loader.extract_triplets(model_obj, text)
+    model_obj = loader.load_triplet_model(model, **kwargs)
+    
+    # REBEL needs special tokens to be preserved
+    if "skip_special_tokens" not in kwargs:
+        kwargs["skip_special_tokens"] = False
+        
+    results = loader.extract_triplets(model_obj, text, **kwargs)
 
     triplets = []
     for result in results:
-        # Parse result based on model output format
-        # This is a placeholder - actual parsing would depend on the model
         if "triplet" in result:
-            # Parse triplet string (format depends on model)
-            pass
+            decoded_text = result["triplet"]
+            
+            # Clean up common special tokens that might interfere or are noise
+            decoded_text = decoded_text.replace("<s>", "").replace("</s>", "").replace("<pad>", "")
+            
+            # Parse REBEL format: <triplet> subject <subj> predicate <obj> object
+            # We use a non-greedy match and lookahead for next triplet or end of string
+            import re
+            pattern = r"<triplet>(?P<head>.*?)<subj>(?P<relation>.*?)<obj>(?P<tail>.*?)(?=<triplet>|$)"
+            
+            matches = re.finditer(pattern, decoded_text)
+            for match in matches:
+                head = match.group("head").strip()
+                relation = match.group("relation").strip()
+                tail = match.group("tail").strip()
+                
+                if head and relation and tail:
+                    triplets.append(
+                        Triplet(
+                            subject=head,
+                            predicate=relation,
+                            object=tail,
+                            confidence=0.9, # Model generation doesn't provide per-triplet confidence
+                            metadata={
+                                "model": model,
+                                "extraction_method": "huggingface_rebel"
+                            }
+                        )
+                    )
 
     return triplets
 
@@ -902,44 +2194,290 @@ def extract_triplets_llm(
     relations: Optional[List[Relation]] = None,
     provider: str = "openai",
     model: Optional[str] = None,
+    silent_fail: bool = False,
+    max_text_length: Optional[int] = None,
+    structured_output_mode: str = "typed",
+    max_retries: int = 3,
     **kwargs,
 ) -> List[Triplet]:
-    """LLM-based triplet extraction."""
-    llm = create_provider(provider, model=model, **kwargs)
+    """
+    LLM-based triplet extraction.
+    
+    Args:
+        text: Input text
+        entities: Pre-extracted entities (optional)
+        relations: Pre-extracted relations (optional)
+        provider: LLM provider
+        model: LLM model
+        silent_fail: If True, return empty list on error. If False (default), raise exception.
+        max_text_length: Maximum text length before auto-chunking. None = provider default.
+        max_retries: Maximum number of retries for LLM calls (default: 3)
+        **kwargs: Additional options
+    """
+    # Support llm_model parameter to disambiguate from ML model
+    if "llm_model" in kwargs:
+        model = kwargs.pop("llm_model")
+    
+    # Check cache
+    cache_params = {
+        "provider": provider,
+        "model": model,
+        "max_text_length": max_text_length,
+        "structured_output_mode": structured_output_mode,
+        "max_retries": max_retries,
+        "triplet_types": kwargs.get("triplet_types"),
+        # Include entities/relations hash in cache key implicitly via **cache_params
+        "entities_hash": hash(tuple(sorted([e.text for e in entities]))) if entities else 0,
+        "relations_hash": hash(tuple(sorted([str(r) for r in relations]))) if relations else 0
+    }
+    cached_result = _result_cache.get("triplets", text, **cache_params)
+    if cached_result:
+        logger.debug(f"Cache hit for triplet extraction ({len(cached_result)} triplets)")
+        return cached_result
+    
+    # 1. PRE-EXTRACTION VALIDATION
+    if not text or not text.strip():
+        error_msg = "Text is empty or whitespace only"
+        logger.error(error_msg)
+        if not silent_fail:
+            raise ProcessingError(error_msg)
+        return []
 
-    if not llm.is_available():
-        raise ProcessingError(f"{provider} provider not available")
+    # Pass api_key if provided in kwargs
+    provider_kwargs = kwargs.copy()
+    
+    # Check if api_key is provided but empty, or not provided at all
+    if "api_key" not in provider_kwargs or not provider_kwargs["api_key"]:
+        import os
+        env_key = f"{provider.upper()}_API_KEY"
+        api_key = os.getenv(env_key)
+        if api_key:
+            provider_kwargs["api_key"] = api_key
+            
+    # Remove None/empty API key if still present to avoid provider errors
+    if "api_key" in provider_kwargs and not provider_kwargs["api_key"]:
+        del provider_kwargs["api_key"]
 
-    prompt = f"""Extract RDF triplets (subject-predicate-object) from the following text.
+    # 2. PROVIDER VALIDATION
+    try:
+        llm = create_provider(provider, model=model, **provider_kwargs)
+        if not llm.is_available():
+            error_msg = f"{provider} provider not available for triplet extraction."
+            logger.error(error_msg)
+            if not silent_fail:
+                raise ProcessingError(error_msg)
+            return []
+    except Exception as e:
+        error_msg = f"Failed to create {provider} provider for triplets: {e}"
+        logger.error(error_msg)
+        if not silent_fail:
+            raise ProcessingError(error_msg) from e
+        return []
 
-Text: {text}
+    # 3. TEXT LENGTH CHECK AND CHUNKING
+    if max_text_length is None:
+        # Default limits for chunking only - NOT for LLM generation
+        max_text_length = {
+            "groq": 64000,
+            "openai": 64000,
+            "gemini": 64000,
+            "anthropic": 64000,
+            "deepseek": 64000,
+        }.get(provider.lower(), 32000)
+    
+    if len(text) > max_text_length:
+        logger.info(f"Text length ({len(text)}) exceeds limit for triplets. Chunking...")
+        return _extract_triplets_chunked(
+            text, provider=provider, model=model, 
+            silent_fail=silent_fail, max_text_length=max_text_length, 
+            max_retries=max_retries,
+            **kwargs
+        )
+    
+    # Use custom triplet types if provided
+    triplet_types = kwargs.get("triplet_types")
+    if triplet_types:
+        triplet_types_str = ", ".join(triplet_types)
+        triplet_types_instruction = f"""
+Preferred triplet predicates: {triplet_types_str}.
+You may also use related or similar predicates if they better capture the relationship (e.g., variations, synonyms, or domain-specific predicates).
+If a predicate doesn't fit any of the preferred types, use the most appropriate type from the preferred list or a closely related type that accurately describes the relationship."""
+    else:
+        triplet_types_instruction = """
+Extract meaningful triplets (subject-predicate-object). Use appropriate predicates that accurately describe the relationship.
+Common predicates include: is_a, part_of, has_property, related_to, caused_by, etc."""
 
-Return JSON format: [{{"subject": "...", "predicate": "...", "object": "...", "confidence": 0.9}}]"""
+    if not SCHEMAS_AVAILABLE:
+        raise ImportError("Pydantic schemas not available. Install pydantic/instructor to use LLM extraction.")
+
+    prompt = f"""Extract RDF triplets (subject-predicate-object) from the provided text.
+Return the result as a JSON object with a "triplets" key containing the list of triplets.
+Each triplet must have 'subject', 'predicate', and 'object' fields.
+
+Example output (JSON format only):
+{{
+  "triplets": [
+    {{"subject": "Subject", "predicate": "predicate_relation", "object": "Object", "confidence": 0.99}},
+    {{"subject": "Concept A", "predicate": "is_a", "object": "Concept B", "confidence": 0.95}}
+  ]
+}}
+
+Instructions:
+1. Extract triplets ONLY from the text provided below.
+2. Do not include any triplets from the example above.
+3. Ensure subjects and objects are substrings from the text.
+4. {triplet_types_instruction}
+
+Text to extract from:
+{text}"""
 
     try:
-        result = llm.generate_structured(prompt)
+        # Use typed generation with Pydantic schema
+        call_kwargs = kwargs.copy()
+        call_kwargs["max_retries"] = max_retries
+        result_obj = llm.generate_typed(prompt, schema=TripletsResponse, **call_kwargs)
+        
+        # Convert back to internal Triplet format
         triplets = []
-
-        if isinstance(result, list):
-            for item in result:
-                triplets.append(
-                    Triplet(
-                        subject=item.get("subject", ""),
-                        predicate=item.get("predicate", ""),
-                        object=item.get("object", ""),
-                        confidence=item.get("confidence", 0.9),
-                        metadata={
-                            "provider": provider,
-                            "model": model,
-                            "extraction_method": "llm",
-                        },
-                    )
+        for t_out in result_obj.triplets:
+            triplets.append(Triplet(
+                subject=t_out.subject,
+                predicate=t_out.predicate,
+                object=t_out.object,
+                confidence=t_out.confidence,
+                metadata={
+                    "provider": provider, 
+                    "model": model, 
+                    "extraction_method": "llm_typed"
+                }
+            ))
+        
+        logger.info(f"Successfully extracted {len(triplets)} triplets using {provider}/{model} (typed)")
+        _result_cache.set("triplets", text, triplets, **cache_params)
+        return triplets
+        
+    except Exception as e:
+        # Check for length/token limit errors
+        error_msg_str = str(e).lower()
+        if "length" in error_msg_str or "max_tokens" in error_msg_str:
+            logger.warning(f"LLM output truncated due to length limit. Reducing chunk size and retrying... ({e})")
+            
+            # Determine new chunk size (halve it)
+            current_max = max_text_length or len(text)
+            new_max = current_max // 2
+            
+            if new_max > 100: # Minimum viable chunk size check
+                return _extract_triplets_chunked(
+                    text, provider=provider, model=model, 
+                    silent_fail=silent_fail, max_text_length=new_max, 
+                    **kwargs
                 )
 
-        return triplets
-    except Exception as e:
-        logger.error(f"LLM triplet extraction failed: {e}")
+        error_msg = f"LLM triplet extraction failed ({provider}/{model}): {e}"
+        logger.error(error_msg, exc_info=True)
+        if not silent_fail:
+            if isinstance(e, ProcessingError):
+                raise
+            raise ProcessingError(error_msg) from e
         return []
+
+
+def _parse_triplet_result(result: Any, provider: str, model: Optional[str]) -> List[Triplet]:
+    """Helper to parse raw LLM result into Triplet objects."""
+    triplets = []
+    items = []
+    
+    if isinstance(result, list):
+        items = result
+    elif isinstance(result, dict):
+        for key in ["triplets", "data", "results"]:
+            if key in result and isinstance(result[key], list):
+                items = result[key]
+                break
+        if not items and "subject" in result:
+            items = [result]
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+            
+        subject = item.get("subject", "")
+        predicate = item.get("predicate", "")
+        obj = item.get("object", "")
+        
+        if not subject or not predicate or not obj:
+            continue
+            
+        triplets.append(
+            Triplet(
+                subject=str(subject),
+                predicate=str(predicate),
+                object=str(obj),
+                confidence=item.get("confidence", 0.9),
+                metadata={
+                    "provider": provider,
+                    "model": model,
+                    "extraction_method": "llm",
+                },
+            )
+        )
+    return triplets
+
+
+def _extract_triplets_chunked(
+    text: str,
+    provider: str,
+    model: Optional[str],
+    silent_fail: bool,
+    max_text_length: int,
+    structured_output_mode: str = "typed",
+    **kwargs
+) -> List[Triplet]:
+    """Internal helper to extract triplets from long text by chunking."""
+    from ..split import TextSplitter
+    
+    splitter = TextSplitter(
+        method="recursive",
+        chunk_size=max_text_length,
+        chunk_overlap=int(max_text_length * 0.1)
+    )
+    chunks = splitter.split(text)
+    
+    all_triplets = []
+    
+    from .config import resolve_max_workers
+    max_workers = resolve_max_workers(explicit=kwargs.get("max_workers"))
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_chunk = {}
+        for i, chunk in enumerate(chunks):
+            logger.debug(f"Scheduling triplet extraction for chunk {i+1}/{len(chunks)}")
+            future = executor.submit(
+                extract_triplets_llm,
+                chunk.text,
+                provider=provider,
+                model=model,
+                silent_fail=False,
+                max_text_length=len(chunk.text) + 1,
+                structured_output_mode=structured_output_mode,
+                **kwargs
+            )
+            future_to_chunk[future] = i
+        
+        for future in as_completed(future_to_chunk):
+            i = future_to_chunk[future]
+            try:
+                chunk_triplets = future.result()
+                all_triplets.extend(chunk_triplets)
+            except Exception as e:
+                if not silent_fail:
+                    logger.error(f"Chunk {i+1} failed: {e}")
+                    raise
+                logger.warning(f"Chunk {i+1} failed (silent): {e}")
+                
+    return all_triplets
+
+
 
 
 # ============================================================================
@@ -986,6 +2524,7 @@ def get_relation_method(method_name: str):
         "pattern": extract_relations_pattern,
         "regex": extract_relations_regex,
         "cooccurrence": extract_relations_cooccurrence,
+        "similarity": extract_relations_similarity,
         "dependency": extract_relations_dependency,
         "ml": extract_relations_dependency,  # Alias for dependency
         "spacy": extract_relations_dependency,  # Alias for dependency
