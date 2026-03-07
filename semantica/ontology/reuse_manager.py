@@ -363,6 +363,60 @@ class ReuseManager:
     def list_known_ontologies(self) -> List[str]:
         """List known ontology URIs."""
         return list(self.known_ontologies.keys())
+    
+    def suggest_alignments(
+        self, target: Dict[str, Any], source: Dict[str, Any], **options
+    ) -> List[Dict[str, str]]:
+        """
+        Suggest alignments between a source and target ontology based on heuristics.
+        Currently matches identical class/property names with differing URIs.
+
+        Args:
+            target: Target ontology dictionary
+            source: Source ontology dictionary
+            **options: Additional heuristics configurations
+
+        Returns:
+            List of alignment dictionaries (source_uri, target_uri, predicate, reason)
+        """
+        suggestions = []
+        
+        # Helper to find matches based on identical names
+        def find_matches(target_items, source_items, entity_type):
+            predicate = (
+                "http://www.w3.org/2002/07/owl#equivalentClass" 
+                if entity_type == "class" 
+                else "http://www.w3.org/2002/07/owl#equivalentProperty"
+            )
+            
+            for s_item in source_items:
+                s_uri = s_item.get("uri")
+                s_name = s_item.get("name", "").strip().lower()
+                if not s_uri or not s_name:
+                    continue
+                    
+                for t_item in target_items:
+                    t_uri = t_item.get("uri")
+                    t_name = t_item.get("name", "").strip().lower()
+                    
+                    if not t_uri or not t_name:
+                        continue
+                        
+                    # If names match exactly but URIs are different, suggest an alignment
+                    if s_name == t_name and s_uri != t_uri:
+                        suggestions.append({
+                            "source_uri": s_uri,
+                            "target_uri": t_uri,
+                            "predicate": predicate,
+                            "reason": f"Exact label match for {entity_type}: '{s_item.get('name')}'"
+                        })
+
+
+        find_matches(target.get("classes", []), source.get("classes", []), "class")
+        find_matches(target.get("properties", []), source.get("properties", []), "property")
+        
+        return suggestions
+        
 
     def merge_ontology_data(
         self, target: Dict[str, Any], source: Dict[str, Any], **options
@@ -437,6 +491,16 @@ class ReuseManager:
                 for imp in source["imports"]:
                     if imp not in target["imports"]:
                         target["imports"].append(imp)
+            
+            if options.get("compute_alignments", False):
+                self.progress_tracker.update_tracking(
+                    tracking_id, message="Computing suggested alignments..."
+                )
+                suggested = self.suggest_alignments(target, source, **options)
+                if suggested:
+                    if "suggested_alignments" not in target:
+                        target["suggested_alignments"] = []
+                    target["suggested_alignments"].extend(suggested)
 
             self.progress_tracker.stop_tracking(
                 tracking_id,
