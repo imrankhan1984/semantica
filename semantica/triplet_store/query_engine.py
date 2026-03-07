@@ -290,17 +290,23 @@ class QueryEngine:
         )
 
         # SPARQL query to find bidirectional alignments
+        
+        safe_uri = self._sanitize_uri(entity_uri)
         query = f"""
         SELECT DISTINCT ?aligned WHERE {{
-            {{ <{entity_uri}> ?p ?aligned }}
+            {{ <{safe_uri}> ?p ?aligned }}
             UNION
-            {{ ?aligned ?p <{entity_uri}> }}
+            {{ ?aligned ?p <{safe_uri}> }}
             
-            FILTER (
-                STRSTARTS(STR(?p), "http://www.w3.org/2002/07/owl#equivalent") ||
-                STRSTARTS(STR(?p), "http://www.w3.org/2002/07/owl#sameAs") ||
-                STRSTARTS(STR(?p), "http://www.w3.org/2004/02/skos/core#")
-            )
+            FILTER (?p IN (
+                <http://www.w3.org/2002/07/owl#equivalentClass>,
+                <http://www.w3.org/2002/07/owl#equivalentProperty>,
+                <http://www.w3.org/2002/07/owl#sameAs>,
+                <http://www.w3.org/2004/02/skos/core#exactMatch>,
+                <http://www.w3.org/2004/02/skos/core#closeMatch>,
+                <http://www.w3.org/2004/02/skos/core#broadMatch>,
+                <http://www.w3.org/2004/02/skos/core#narrowMatch>
+            ))
         }}
         """
         
@@ -417,6 +423,12 @@ class QueryEngine:
 
         cache_key = self._get_cache_key(query)
         self.query_cache[cache_key] = result
+    
+    def _sanitize_uri(self, uri: str) -> str:
+        """Prevent SPARQL injection by percent-encoding dangerous characters."""
+        if not isinstance(uri, str):
+            return ""
+        return uri.replace("<", "%3C").replace(">", "%3E")
 
     def clear_cache(self) -> None:
         """Clear query cache."""

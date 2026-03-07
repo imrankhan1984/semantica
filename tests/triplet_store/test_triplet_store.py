@@ -134,3 +134,23 @@ class TestTripletStore(unittest.TestCase):
         self.assertIn("http://ex.org/aligned_entity", result)
         self.assertEqual(len(result), 2)
         mock_backend.execute_sparql.assert_called_once()
+        
+    def test_end_to_end_cross_ontology_uri_flow(self):
+        engine = QueryEngine()
+        engine.expand_entity_uri = MagicMock(return_value=["http://ex.org/1", "http://aligned.org/2"])
+        
+
+        original_uri = "http://ex.org/1"
+        expanded = engine.expand_entity_uri(original_uri, store_backend=MagicMock(), use_alignments=True)
+        values_clause = engine.build_values_clause("subject", expanded)
+        
+        mock_select_query = f"""
+            SELECT DISTINCT ?aligned WHERE {{
+                {values_clause}
+                ?subject <http://schema.org/name> ?name .
+            }}
+        """
+        
+        self.assertIn("<http://ex.org/1> <http://aligned.org/2>", mock_select_query)
+        self.assertIn("VALUES ?subject", mock_select_query)
+        engine.expand_entity_uri.assert_called_once()

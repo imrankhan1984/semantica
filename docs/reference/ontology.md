@@ -262,19 +262,21 @@ You can create and query alignments programmatically using the `OntologyEngine`:
 
 ```python
 from semantica.ontology.engine import OntologyEngine
+from semantica.triplet_store.triplet_store import TripletStore
 
-# Ensure your engine is initialized with a TripletStore instance
+# Setup the store and engine (using Blazegraph as an example)
+my_triplet_store = TripletStore(backend="blazegraph")
 engine = OntologyEngine(store=my_triplet_store)
 
 # Create an alignment between an internal class and a standard schema
 engine.create_alignment(
-    source_uri="http://internal.org/ontology/Employee"
-    target_uri="[http://schema.org/Person]",
-    predicate="[http://www.w3.org/2002/07/owl#equivalentClass]"
+    source_uri="http://internal.org/ontology/Employee",
+    target_uri="http://schema.org/Person",
+    predicate="http://www.w3.org/2002/07/owl#equivalentClass"
 )
 
 # Retrieve all bidirectional alignments for a specific entity
-alignments = engine.get_alignments("[http://internal.org/ontology/Employee](http://internal.org/ontology/Employee)")
+alignments = engine.get_alignments("http://internal.org/ontology/Employee")
 ```
 ### Automated Alignment Suggestions
 
