@@ -48,6 +48,8 @@ Semantica is the **context and intelligence layer** you add to your AI stack:
 
 Works alongside LangChain, LlamaIndex, AutoGen, CrewAI, and any LLM provider — Semantica is not a replacement, it's the accountability layer on top.
 
+### Quick Installation
+
 ```bash
 pip install semantica
 ```
