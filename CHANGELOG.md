@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-10
+
 - **Context Graph Feature Completeness** (by @KaifAhmad1):
   - Added `valid_from` / `valid_until` temporal validity fields to `ContextNode` and `ContextEdge` dataclasses — both expose `is_active(at_time=None) -> bool`; nodes/edges without these fields are always considered active
   - Added `add_node(valid_from=..., valid_until=...)` and `add_edge(valid_from=..., valid_until=...)` support — validity windows are extracted from `**properties` and stored as first-class dataclass fields, not in metadata
@@ -14,10 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `min_weight: float = 0.0` parameter to `ContextGraph.get_neighbors()` — edges with weight below the threshold are skipped during BFS traversal, enabling weighted/confidence-filtered multi-hop navigation; fully backward-compatible (default 0.0 passes all edges)
   - Added `ContextGraph.link_graph(other_graph, source_node_id, target_node_id, link_type="CROSS_GRAPH") -> str` — creates a navigable bridge between two separate `ContextGraph` instances; records a marker edge internally and returns a `link_id`
   - Added `ContextGraph.navigate_to(link_id) -> (other_graph, target_node_id)` — resolves a `link_id` to the target graph and its entry node, enabling hierarchical cross-graph traversal (e.g. agent moving from a high-level decision graph into a domain-specific sub-graph)
+  - Added `ContextGraph.resolve_links(registry)` — reconnects cross-graph links after `load_from_file()`; `save_to_file()` now persists a `links` section with `other_graph_id` so navigation survives the full save/load cycle
+  - Added `graph_id` field to `ContextGraph` — stable UUID per instance, persisted to JSON, so separate graphs can identify each other after reload
+  - Fixed `is_active()` on `ContextNode` and `ContextEdge` — tz-aware `datetime` inputs are now normalised to tz-naive UTC before comparison, preventing `TypeError` when callers pass `datetime.now(timezone.utc)`
+  - Fixed `valid_from` / `valid_until` serialisation — `add_nodes()`, `add_edges()`, `to_dict()`, and `from_dict()` all now preserve and restore validity windows; previously these fields were silently lost
+  - Fixed cross-graph link artifact — `link_graph()` now pre-creates a `"cross_graph_link"` typed `ContextNode` for the marker before inserting the marker edge, preventing `_add_internal_edge()` from auto-creating a phantom `"entity"` node
+  - Added 14 tests in `tests/context/test_cross_graph_navigation.py` covering link creation, phantom-node prevention, and full save/load round-trips with `resolve_links()`
   - Fixed `pipeline_builder.add_step()` return type annotation from `"PipelineBuilder"` to `"PipelineStep"` — implementation was already correct per 0.3.0-beta changelog, only signature and docstring were stale
-  - Fixed `test_hybrid_search_performance` timing threshold from `< 1.0s` to `< 5.0s` — real `sentence-transformers` (384-dim) on development machines exceeds the 1.0s gate; consistent with the vector store batch threshold relaxation applied in 0.3.0-beta
+  - Fixed `test_hybrid_search_performance` timing computation — accumulated a real `search_times` list and compute true average; raised threshold to `< 5.0s` to account for real `sentence-transformers` (384-dim) latency
 
-## [0.3.0] - 2026-03-10
+
 
 - **0.3.0 Bug Fixes & Comprehensive Real-World Tests** (by @KaifAhmad1):
   - Fixed `ProvenanceTracker` missing from `semantica/kg/__init__.py` exports — `from semantica.kg import ProvenanceTracker` now works correctly
