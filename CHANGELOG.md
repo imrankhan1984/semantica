@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Ontology Alignment API** (PR #361 by @ZohaibHassan16, review & fixes by @KaifAhmad1):
+  - Alignment representation using standard RDF predicates: `owl:equivalentClass`, `owl:equivalentProperty`, `owl:sameAs`, `skos:exactMatch`, `skos:closeMatch`, `skos:broadMatch`, `skos:narrowMatch`, `skos:relatedMatch`
+  - `OntologyEngine.create_alignment(source_uri, target_uri, predicate)` — store alignment triples in TripletStore
+  - `OntologyEngine.get_alignments(entity_uri)` — bidirectional retrieval of all alignments for an entity
+  - `OntologyEngine.list_alignments(ontology_uri=None)` — list all alignments, optionally filtered by ontology namespace
+  - `NamespaceManager.get_alignment_predicates()` — expose standard OWL/SKOS alignment URIs as a convenience dict
+  - `ReuseManager.suggest_alignments(target, source)` — O(N+M) hashmap heuristic to suggest alignments based on exact label matches across ontologies
+  - `ReuseManager.merge_ontology_data(..., compute_alignments=True)` — optionally attach suggested alignments to merge output without auto-committing unverified triples
+  - `QueryEngine.expand_entity_uri(uri, store, use_alignments=True)` — bidirectional SPARQL expansion to include aligned equivalents; no-ops when flag is False
+  - `QueryEngine.build_values_clause(variable, uris)` — generate a SPARQL `VALUES` clause for injecting expanded URIs into queries
+  - Alignment-aware queries section added to `docs/reference/triplet_store.md`
+  - Ontology Alignment section added to `docs/reference/ontology.md`
+  - **Fixes applied post-review (by @KaifAhmad1)**:
+    - Fixed progress tracker leak in `expand_entity_uri` — `stop_tracking` was only called inside the `hasattr(execute_sparql)` branch; backends without it silently leaked a tracker entry
+    - Fixed `relatedMatch` predicate gap — `get_alignment_predicates()` exposed `skos:relatedMatch` but all three SPARQL FILTER lists omitted it, making those alignments permanently invisible
+    - Fixed SPARQL injection in `list_alignments` — previously only `"` was escaped; `\`, `{`, and `}` are now also percent-encoded to prevent WHERE block breakout
+    - Fixed SPARQL injection in `build_values_clause` — URIs now run through `_sanitize_uri` before wrapping in angle-bracket literals
+    - Added full-URI validation in `create_alignment` — raises `ProcessingError` if predicate is a CURIE instead of a full URI, preventing silent storage of unqueryable triples
+    - Fixed E2E test `test_end_to_end_cross_ontology_uri_flow` — previously mocked the method under test; now uses a real mock backend with `execute_sparql` to exercise the actual expansion and VALUES clause injection flow
+  - 19 tests added covering: `create_alignment`, `get_alignments`, `suggest_alignments`, merge with alignment computation, `expand_entity_uri` (enabled/disabled), `build_values_clause`, and full E2E cross-ontology query flow
+
 - Fixed: Context Graphs decision tracking bugs and added comprehensive test coverage (PR #315 by @KaifAhmad1)
   - Fixed empty/None decision ID handling in ContextGraph.add_decision()
   - Fixed None metadata handling to prevent TypeError
