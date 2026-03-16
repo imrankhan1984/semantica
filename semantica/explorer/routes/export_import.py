@@ -154,8 +154,14 @@ async def import_file(
             nodes = data.get("nodes", data.get("entities", []))
             edges = data.get("edges", data.get("relationships", []))
 
-            added_nodes = await asyncio.to_thread(session.graph.add_nodes, nodes)
-            added_edges = await asyncio.to_thread(session.graph.add_edges, edges)
+            for edge in edges:
+                if "source" in edge and "source_id" not in edge:
+                    edge["source_id"] = edge["source"]
+                if "target" in edge and "target_id" not in edge:
+                    edge["target_id"] = edge["target"]
+
+            added_nodes = await asyncio.to_thread(session.add_nodes, nodes)
+            added_edges = await asyncio.to_thread(session.add_edges, edges)
 
             result = {
                 "status": "success",

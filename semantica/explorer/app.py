@@ -73,10 +73,9 @@ def create_app(session: Optional[GraphSession] = None) -> FastAPI:
 
     @app.exception_handler(Exception)
     async def generic_error_handler(request: Request, exc: Exception):
-        tb = traceback.format_exc()
         return JSONResponse(
             status_code=500,
-            content={"detail": f"Internal Server Error: {exc}", "traceback": tb},
+            content={"detail": "Internal Server Error"},
         )
 
     from .routes.graph import router as graph_router
@@ -124,8 +123,8 @@ def create_app(session: Optional[GraphSession] = None) -> FastAPI:
 
 
     static_dir = Path(__file__).resolve().parent.parent / "static"
-    if static_dir.is_dir():
-        from fastapi.staticfiles import StaticFiles
-        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
+    static_dir.mkdir(parents=True, exist_ok=True)
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 
     return app
