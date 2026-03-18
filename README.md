@@ -683,8 +683,16 @@ ontology = importer.load("context.jsonld")
 - Novita AI — OpenAI-compatible provider (`deepseek/deepseek-v3.2` and more); configure via `NOVITA_API_KEY`
 
 **Agentic Frameworks**
-- Complements LangChain, LlamaIndex, AutoGen, CrewAI, Google ADK
-- **Agno** — first-class integration (`pip install semantica[agno]`); five components: `AgnoContextStore` (graph-backed agent memory), `AgnoKnowledgeGraph` (multi-hop GraphRAG knowledge base), `AgnoDecisionKit` (6 decision-intelligence tools), `AgnoKGToolkit` (7 KG tools), `AgnoSharedContext` (shared context graph for multi-agent teams)
+- Complements LangChain, LlamaIndex, AutoGen, CrewAI, Google ADK, and more
+
+> **Agno — First-Class Integration** `pip install semantica[agno]`
+>
+> Semantica ships a dedicated Agno integration with five ready-to-use components:
+> - **`AgnoContextStore`** — graph-backed agent memory
+> - **`AgnoKnowledgeGraph`** — multi-hop GraphRAG knowledge base
+> - **`AgnoDecisionKit`** — 6 decision-intelligence tools
+> - **`AgnoKGToolkit`** — 7 knowledge-graph pipeline tools
+> - **`AgnoSharedContext`** — shared context graph for multi-agent teams
 
 **Export**
 - RDF: Turtle, JSON-LD, N-Triples, XML · Parquet · ArangoDB AQL
