@@ -141,32 +141,35 @@ class TemporalVersionManager(BaseVersionManager):
             ProcessingError: If storage operation fails
         """
         from .change_log import ChangeLogEntry
+        from ..utils.exceptions import ValidationError
 
         change_entry = ChangeLogEntry(
             timestamp=datetime.now().isoformat(), author=author, description=description
         )
 
     
-        nodes_data = graph.get("nodes", graph.get("entities", [])).copy()
-        edges_data = graph.get("edges", graph.get("relationships", [])).copy()
+        valid_keys = {"nodes", "edges", "entities", "relationships"}
+        if not any(key in graph for key in valid_keys):
+            raise ValidationError(
+                "Graph dictionary is missing required schema keys. "
+                "Must contain 'nodes'/'edges' or 'entities'/'relationships'."
+            )
 
- 
+        nodes_data = graph.get("nodes") or graph.get("entities") or []
+        edges_data = graph.get("edges") or graph.get("relationships") or []
+
         snapshot = {
             "label": version_label,
             "timestamp": change_entry.timestamp,
             "author": change_entry.author,
             "description": change_entry.description,
-            "nodes": nodes_data,
-            "edges": edges_data,
-            "entities": nodes_data,
-            "relationships": edges_data,
+            "nodes": nodes_data.copy() if nodes_data else [],
+            "edges": edges_data.copy() if edges_data else [],
             "metadata": options.get("metadata", {}),
         }
 
         snapshot["checksum"] = compute_checksum(snapshot)
-
         self.storage.save(snapshot)
-
         self.logger.info(f"Created snapshot '{version_label}' by {author}")
         return snapshot
 
@@ -435,33 +438,25 @@ class OntologyVersionManager(BaseVersionManager):
         Returns:
             dict: Ontology version snapshot
         """
-        # Validate inputs
+        from .change_log import ChangeLogEntry
+        
         change_entry = ChangeLogEntry(
             timestamp=datetime.now().isoformat(), author=author, description=description
         )
 
-        # Create snapshot
         snapshot = {
             "label": version_label,
             "timestamp": change_entry.timestamp,
             "author": change_entry.author,
             "description": change_entry.description,
-            "ontology_iri": ontology_data.get("uri", ""),
-            "version_info": ontology_data.get("version_info", {}),
-            "structure": ontology_data.get("structure", {}),
+            "ontology_data": ontology_data,
+            "structure": ontology_data.get("structure", {}), 
             "metadata": options.get("metadata", {}),
         }
-
-        # Compute and add checksum
+        
         snapshot["checksum"] = compute_checksum(snapshot)
-
-        # Store snapshot
         self.storage.save(snapshot)
-
-        # Also store in memory for compatibility
-        self.versions[version_label] = snapshot
-
-        self.logger.info(f"Created ontology snapshot '{version_label}' by {author}")
+        self.logger.info(f"Created snapshot '{version_label}' by {author}")
         return snapshot
 
     def compare_versions(
