@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **ContextGraph Traversal Fallbacks for DecisionQuery & DecisionRecorder** (PR #386 by @ZohaibHassan16, reviewed and fixed by @KaifAhmad1):
+  - Added native `ContextGraph` fallback execution paths to all 7 `DecisionQuery` methods (`_find_precedents_basic`, `find_by_category`, `find_by_entity`, `find_by_time_range`, `multi_hop_reasoning`, `trace_decision_path`, `find_similar_exceptions`) — resolves issue #379 where hardcoded Cypher queries broke in-memory usage
+  - Added native `ContextGraph` fallback paths to 4 `DecisionRecorder` methods (`link_entities`, `record_exception`, `link_precedents`, `_store_decision_node`, `_store_exception_node`) using `add_node` / `add_edge` primitives
+  - Implemented undirected BFS in `multi_hop_reasoning` fallback — traverses both outgoing and incoming edges so decisions are reachable from linked entities (matches Cypher `(start)-[*1..N]-(d:Decision)` semantics)
+  - Fixed `isinstance(graph_store, ContextGraph)` guards → `type(graph_store) is ContextGraph` — prevents `Mock(spec=ContextGraph)` from triggering fallback branches and breaking 2 existing tests
+  - Fixed `add_node(properties=metadata)` call in `_store_decision_node` and `_store_exception_node` — changed to `**metadata` so all decision fields are stored flat and remain readable via `_dict_to_decision`; previous form silently nested every field under a `"properties"` key
+  - Fixed spurious `properties={}` keyword argument in all `add_edge` fallback calls — argument did not match the actual `add_edge(**properties)` signature
+  - Fixed tz-aware / naive `datetime` mismatch in `find_by_time_range` fallback — strips `tzinfo` from aware bounds when stored timestamps are naive, preventing `TypeError` at comparison time
+  - Hoisted `find_edges()` calls out of the BFS `while` loop in `trace_decision_path` — edges are now fetched once per call instead of once per visited node, eliminating O(nodes × total_edges) repeated full-graph scans
+  - Removed duplicate `from ..embeddings import EmbeddingGenerator` import in `decision_query.py`
+  - Added `tests/context/test_decision_query_fallback.py` with 14 tests: full integration test covering the complete fallback flow end-to-end, plus 13 targeted unit tests covering each `DecisionQuery` and `DecisionRecorder` fallback method individually, tz-aware/naive datetime mixing, and `Mock` guard correctness
+
 - **ContextGraph Thread Safety & Pagination** (PR #385, Issues #378 #376 by @ZohaibHassan16, review & fixes by @KaifAhmad1):
   - `ContextGraph`: added `threading.RLock` (`self._lock`) to `__init__`; all mutation paths (`add_nodes`, `add_edges`, `add_node`, `add_edge`, `save_to_file`, `load_from_file`, `link_graph`) and all read/query paths (`find_nodes`, `find_edges`, `find_node`, `find_active_nodes`, `get_neighbors`, `query`, `stats`, `density`) now protected with `with self._lock:` to prevent race-condition corruption under concurrent FastAPI workers
   - `find_nodes` and `find_edges` gained native `skip`/`limit` pagination parameters so the explorer layer never loads the full collection into memory to slice it
