@@ -154,6 +154,10 @@ class NERExtractor:
                 self.logger.warning(
                     f"spaCy model {self.model_name} not found. ML method will fallback."
                 )
+            except Exception as exc:
+                self.logger.warning(
+                    f"spaCy model {self.model_name} failed to initialize ({exc}). ML method will fallback."
+                )
 
     def extract(self, text: Union[str, List[Dict[str, Any]], List[str]], pipeline_id: Optional[str] = None, **kwargs) -> Union[List[Entity], List[List[Entity]]]:
         """

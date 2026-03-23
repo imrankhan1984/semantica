@@ -101,6 +101,16 @@ class TestNERConfigurations(unittest.TestCase):
             self.assertEqual(entities[0].metadata["extraction_method"], "ml")
             self.assertEqual(entities[0].metadata["model"], "en_core_web_trf")
 
+    @patch('semantica.semantic_extract.ner_extractor.spacy')
+    def test_ner_ml_init_falls_back_when_spacy_runtime_is_broken(self, mock_spacy):
+        """Test NER init does not crash when spaCy is installed but unusable at runtime."""
+        mock_spacy.load.side_effect = RuntimeError("ConfigSchemaNlp is not fully defined")
+
+        with patch('semantica.semantic_extract.ner_extractor.SPACY_AVAILABLE', True):
+            extractor = NERExtractor(method="ml", model="en_core_web_sm")
+
+        self.assertIsNone(extractor.nlp)
+
     def test_ner_regex_config(self):
         """Test NER with Regex configuration"""
         print("\nTesting NER with Regex configuration...")
