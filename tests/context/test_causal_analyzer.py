@@ -12,6 +12,7 @@ from typing import List, Dict, Any
 
 from semantica.context.decision_models import Decision
 from semantica.context.causal_analyzer import CausalChainAnalyzer
+from semantica.context.context_graph import ContextGraph
 
 
 class TestCausalChainAnalyzer:
@@ -510,6 +511,84 @@ class TestCausalChainAnalyzer:
         # Recent decision should come first
         assert chain[0].decision_id == "decision_001"
         assert chain[1].decision_id == "decision_002"
+
+    def test_trace_at_time_excludes_late_recorded_facts(self):
+        """trace_at_time should filter by relationship recorded_at, not valid time."""
+        graph = ContextGraph()
+        decision_1 = Decision(
+            decision_id="decision_001",
+            category="ops",
+            scenario="Initial review",
+            reasoning="Start",
+            outcome="approved",
+            confidence=0.9,
+            timestamp=datetime.now(),
+            decision_maker="agent",
+        )
+        decision_2 = Decision(
+            decision_id="decision_002",
+            category="ops",
+            scenario="Follow-up",
+            reasoning="Depends on initial review",
+            outcome="approved",
+            confidence=0.9,
+            timestamp=datetime.now(),
+            decision_maker="agent",
+        )
+        graph.add_decision(decision_1)
+        graph.add_decision(decision_2)
+        graph.add_edge(
+            "decision_001",
+            "decision_002",
+            "CAUSED",
+            recorded_at="2024-01-10T00:00:00",
+        )
+
+        analyzer = CausalChainAnalyzer(graph_store=graph)
+
+        early_chain = analyzer.trace_at_time("decision_002", "2024-01-05T00:00:00")
+        later_chain = analyzer.trace_at_time("decision_002", "2024-01-15T00:00:00")
+
+        assert early_chain == []
+        assert [decision.decision_id for decision in later_chain] == ["decision_001"]
+
+    def test_trace_at_time_returns_empty_before_any_facts_recorded(self):
+        """When the cutoff predates all facts, trace_at_time should return an empty chain."""
+        graph = ContextGraph()
+        graph.add_decision(
+            Decision(
+                decision_id="decision_001",
+                category="ops",
+                scenario="Initial review",
+                reasoning="Start",
+                outcome="approved",
+                confidence=0.9,
+                timestamp=datetime.now(),
+                decision_maker="agent",
+            )
+        )
+        graph.add_decision(
+            Decision(
+                decision_id="decision_002",
+                category="ops",
+                scenario="Follow-up",
+                reasoning="Depends on initial review",
+                outcome="approved",
+                confidence=0.9,
+                timestamp=datetime.now(),
+                decision_maker="agent",
+            )
+        )
+        graph.add_edge(
+            "decision_001",
+            "decision_002",
+            "CAUSED",
+            recorded_at="2024-02-01T00:00:00",
+        )
+
+        analyzer = CausalChainAnalyzer(graph_store=graph)
+
+        assert analyzer.trace_at_time("decision_002", "2024-01-01T00:00:00") == []
 
 
 class TestCausalAnalyzerEdgeCases:

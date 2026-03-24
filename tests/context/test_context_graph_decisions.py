@@ -352,6 +352,99 @@ class TestContextGraphDecisions:
         precedents = context_graph.find_precedents("decision_001", limit=10)
         
         assert len(precedents) == 0
+
+    def test_find_precedents_by_scenario_filters_superseded_as_of(self, context_graph):
+        """Decisions outside the validity window should be excluded for as_of queries."""
+        expired_id = context_graph.record_decision(
+            category="policy",
+            scenario="Use old underwriting threshold",
+            reasoning="Legacy policy",
+            outcome="approved",
+            confidence=0.7,
+            valid_until="2023-01-01T00:00:00",
+        )
+        active_id = context_graph.record_decision(
+            category="policy",
+            scenario="Use new underwriting threshold",
+            reasoning="Replacement policy",
+            outcome="approved",
+            confidence=0.9,
+            valid_from="2023-01-02T00:00:00",
+        )
+
+        results = context_graph.find_precedents_by_scenario(
+            scenario="underwriting threshold",
+            category="policy",
+            as_of="2024-01-01T00:00:00",
+            similarity_threshold=0.0,
+        )
+
+        returned_ids = {item["decision"]["id"] for item in results}
+        assert expired_id not in returned_ids
+        assert active_id in returned_ids
+
+    def test_find_precedents_by_scenario_can_include_superseded(self, context_graph):
+        """Superseded decisions remain queryable when explicitly requested."""
+        expired_id = context_graph.record_decision(
+            category="policy",
+            scenario="Use old threshold",
+            reasoning="Legacy rule",
+            outcome="approved",
+            confidence=0.7,
+            valid_until="2023-01-01T00:00:00",
+        )
+
+        results = context_graph.find_precedents_by_scenario(
+            scenario="old threshold",
+            category="policy",
+            include_superseded=True,
+            similarity_threshold=0.0,
+        )
+
+        returned_ids = {item["decision"]["id"] for item in results}
+        assert expired_id in returned_ids
+
+    def test_state_at_returns_only_valid_items_and_is_serializable(self, context_graph):
+        """state_at should filter by validity window without mutating the graph."""
+        context_graph.add_node(
+            "entity_active",
+            "entity",
+            content="Active entity",
+            valid_from="2024-01-01T00:00:00",
+            valid_until="2024-12-31T23:59:59",
+        )
+        context_graph.add_node(
+            "entity_expired",
+            "entity",
+            content="Expired entity",
+            valid_until="2023-12-31T23:59:59",
+        )
+        context_graph.add_edge(
+            "entity_active",
+            "entity_expired",
+            "related_to",
+            valid_until="2023-12-31T23:59:59",
+        )
+        decision_id = context_graph.record_decision(
+            category="policy",
+            scenario="Current policy",
+            reasoning="Current reasoning",
+            outcome="approved",
+            confidence=0.95,
+            valid_from="2024-01-01T00:00:00",
+        )
+
+        snapshot = context_graph.state_at("2024-06-01T00:00:00")
+
+        assert decision_id in context_graph.nodes
+        node_ids = {node["id"] for node in snapshot["nodes"]}
+        decision_ids = {decision["id"] for decision in snapshot["decisions"]}
+        assert "entity_active" in node_ids
+        assert "entity_expired" not in node_ids
+        assert decision_id in decision_ids
+
+        import json
+        json.dumps(snapshot)
     
     def test_complex_causal_network(self, context_graph):
         """Test complex causal network with multiple relationship types."""

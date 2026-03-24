@@ -97,6 +97,8 @@ class Decision:
     decision_maker: str
     reasoning_embedding: Optional[List[float]] = None
     node2vec_embedding: Optional[List[float]] = None
+    valid_from: Optional[str] = None
+    valid_until: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     
     def __post_init__(self, auto_generate_id: bool = True):
@@ -121,6 +123,8 @@ class Decision:
             "decision_maker": self.decision_maker,
             "reasoning_embedding": self.reasoning_embedding,
             "node2vec_embedding": self.node2vec_embedding,
+            "valid_from": self.valid_from,
+            "valid_until": self.valid_until,
             "metadata": self.metadata
         }
     
