@@ -59,7 +59,7 @@ Production Use Cases:
     - Policy: Trace policy decision consequences
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 from collections import deque
 
@@ -151,6 +151,50 @@ class CausalChainAnalyzer:
         except Exception as e:
             self.logger.error(f"Failed to get causal chain: {e}")
             raise
+
+    def trace_at_time(
+        self,
+        event_id: str,
+        at_time: Any,
+        direction: str = "upstream",
+        max_depth: int = 10,
+    ) -> List[Decision]:
+        """Trace a causal chain using only facts recorded up to ``at_time``."""
+        cutoff = self._normalize_at_time(at_time)
+
+        if direction not in ["upstream", "downstream"]:
+            raise ValueError("Direction must be 'upstream' or 'downstream'")
+        if not (1 <= max_depth <= 100):
+            raise ValueError("max_depth must be between 1 and 20")
+
+        if hasattr(self.graph_store, "nodes") and hasattr(self.graph_store, "edges"):
+            return self._trace_at_time_from_context_graph(event_id, cutoff, direction, max_depth)
+
+        if hasattr(self.graph_store, "execute_query"):
+            rel_pattern = "<-[rel:CAUSED|INFLUENCED|PRECEDENT_FOR]-" if direction == "upstream" else "-[rel:CAUSED|INFLUENCED|PRECEDENT_FOR]->"
+            query = f"""
+            MATCH (start:Decision {{decision_id: $decision_id}})
+            MATCH path = (start){rel_pattern}{{1,{max_depth}}}(end:Decision)
+            WHERE ALL(rel IN relationships(path) WHERE rel.recorded_at IS NOT NULL AND rel.recorded_at <= $at_time)
+            RETURN DISTINCT end, length(path) as distance
+            ORDER BY distance, end.timestamp
+            """
+            results = self.graph_store.execute_query(
+                query,
+                {"decision_id": event_id, "at_time": cutoff.isoformat()},
+            )
+            records = self._extract_records(results)
+            decisions: List[Decision] = []
+            for record in records:
+                decision_data = record.get("end") if isinstance(record, dict) else None
+                if not isinstance(decision_data, dict):
+                    decision_data = record if isinstance(record, dict) else {}
+                decision = self._dict_to_decision(decision_data)
+                decision.metadata["causal_distance"] = record.get("distance", 0)
+                decisions.append(decision)
+            return decisions
+
+        return []
     
     def get_influenced_decisions(
         self,
@@ -558,3 +602,78 @@ class CausalChainAnalyzer:
         if isinstance(results, list):
             return results
         return []
+
+    def _normalize_at_time(self, value: Any) -> datetime:
+        """Normalize supported ``at_time`` inputs."""
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None) if value.tzinfo is None else value.astimezone(timezone.utc).replace(tzinfo=None)
+        if isinstance(value, str):
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=None) if parsed.tzinfo is None else parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        raise ValueError("at_time must be a datetime or ISO datetime string")
+
+    def _trace_at_time_from_context_graph(
+        self,
+        event_id: str,
+        cutoff: datetime,
+        direction: str,
+        max_depth: int,
+    ) -> List[Decision]:
+        """Trace transaction-time causal chains against an in-memory ContextGraph."""
+        eligible_edges = []
+        for edge in getattr(self.graph_store, "edges", []):
+            if edge.edge_type not in ["CAUSED", "INFLUENCED", "PRECEDENT_FOR"]:
+                continue
+            recorded_at = (edge.metadata or {}).get("recorded_at")
+            if recorded_at is None:
+                continue
+            try:
+                edge_recorded_at = self._normalize_at_time(recorded_at)
+            except ValueError:
+                continue
+            if edge_recorded_at <= cutoff:
+                eligible_edges.append(edge)
+
+        if not eligible_edges:
+            return []
+
+        visited = set()
+        queue = deque([(event_id, 0)])
+        decisions: List[Decision] = []
+
+        while queue:
+            current_id, depth = queue.popleft()
+            if current_id in visited or depth > max_depth:
+                continue
+            visited.add(current_id)
+
+            if current_id != event_id:
+                node = getattr(self.graph_store, "nodes", {}).get(current_id)
+                if node and getattr(node, "node_type", "").lower() == "decision":
+                    decision = self._dict_to_decision(
+                        {
+                            "id": node.node_id,
+                            "category": node.properties.get("category", ""),
+                            "scenario": node.properties.get("scenario", node.content),
+                            "reasoning": node.properties.get("reasoning", ""),
+                            "outcome": node.properties.get("outcome", ""),
+                            "confidence": node.properties.get("confidence", 0.0),
+                            "timestamp": node.properties.get("timestamp"),
+                            "decision_maker": node.properties.get("decision_maker", ""),
+                            "metadata": {},
+                        }
+                    )
+                    decision.metadata["causal_distance"] = depth
+                    decisions.append(decision)
+
+            for edge in eligible_edges:
+                if direction == "upstream" and edge.target_id == current_id and depth < max_depth:
+                    queue.append((edge.source_id, depth + 1))
+                if direction == "downstream" and edge.source_id == current_id and depth < max_depth:
+                    queue.append((edge.target_id, depth + 1))
+
+        if direction == "upstream":
+            decisions.sort(key=lambda d: d.metadata.get("causal_distance", 0), reverse=True)
+        else:
+            decisions.sort(key=lambda d: d.metadata.get("causal_distance", 0))
+        return decisions

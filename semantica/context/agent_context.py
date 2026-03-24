@@ -83,6 +83,7 @@ from .decision_recorder import DecisionRecorder
 from .decision_query import DecisionQuery
 from .causal_analyzer import CausalChainAnalyzer
 from .policy_engine import PolicyEngine
+from ..change_management import TemporalVersionManager
 
 
 class AgentContext:
@@ -166,6 +167,8 @@ class AgentContext:
 
         self.vector_store = vector_store
         self.knowledge_graph = knowledge_graph
+        self._checkpoints: Dict[str, Dict[str, Any]] = {}
+        self._temporal_version_manager = kwargs.get("temporal_version_manager")
         
         # Store advanced feature flags
         self.config = {
@@ -1559,7 +1562,9 @@ class AgentContext:
         confidence: float,
         entities: Optional[List[str]] = None,
         cross_system_context: Optional[Dict[str, Any]] = None,
-        decision_maker: Optional[str] = "ai_agent"
+        decision_maker: Optional[str] = "ai_agent",
+        valid_from: Optional[Union[str, datetime]] = None,
+        valid_until: Optional[Union[str, datetime]] = None,
     ) -> str:
         """
         Record decision (wrapper for DecisionRecorder).
@@ -1594,7 +1599,9 @@ class AgentContext:
             outcome=outcome,
             confidence=confidence,
             timestamp=datetime.now(),
-            decision_maker=decision_maker or "ai_agent"
+            decision_maker=decision_maker or "ai_agent",
+            valid_from=valid_from,
+            valid_until=valid_until,
         )
         
         entities = entities or []
@@ -1624,6 +1631,8 @@ class AgentContext:
             confidence=confidence,
             entities=entities,
             decision_maker=decision_maker,
+            valid_from=valid_from,
+            valid_until=valid_until,
             metadata={"cross_system_context": cross_system_context} if cross_system_context else None
         )
         
@@ -1636,7 +1645,9 @@ class AgentContext:
         limit: int = 10,
         use_hybrid_search: bool = True,
         max_hops: int = 3,
-        include_context: bool = True
+        include_context: bool = True,
+        include_superseded: bool = False,
+        as_of: Optional[Union[str, datetime]] = None,
     ) -> List[Decision]:
         """
         Find similar decisions with user controls.
@@ -1665,7 +1676,9 @@ class AgentContext:
                     scenario=scenario,
                     category=category,
                     limit=limit,
-                    use_semantic_search=use_hybrid_search
+                    use_semantic_search=use_hybrid_search,
+                    include_superseded=include_superseded,
+                    as_of=as_of,
                 )
                 # Convert to Decision objects if needed
                 from .decision_models import Decision
@@ -1684,6 +1697,8 @@ class AgentContext:
                         confidence=decision_data["confidence"],
                         timestamp=datetime.fromtimestamp(decision_data["timestamp"]),
                         decision_maker=decision_data.get("decision_maker"),
+                        valid_from=decision_data.get("valid_from"),
+                        valid_until=decision_data.get("valid_until"),
                         metadata=metadata,
                     )
                     decisions.append(decision)
@@ -1779,6 +1794,87 @@ class AgentContext:
                 )
 
         return results[:limit]
+
+    def checkpoint(self, label: str) -> Dict[str, Any]:
+        """Capture the current context state under a label."""
+        snapshot = self._capture_checkpoint_state()
+        self._checkpoints[label] = snapshot
+        return snapshot
+
+    def diff_checkpoints(self, label1: str, label2: str) -> Dict[str, Any]:
+        """Return a structured diff between two named checkpoints."""
+        missing = [label for label in (label1, label2) if label not in self._checkpoints]
+        if missing:
+            raise KeyError(f"Unknown checkpoint label(s): {', '.join(missing)}")
+
+        first = self._checkpoints[label1]
+        second = self._checkpoints[label2]
+
+        first_decisions = {decision.get("id"): decision for decision in first.get("decisions", [])}
+        second_decisions = {decision.get("id"): decision for decision in second.get("decisions", [])}
+        first_relationships = {self._relationship_key(rel): rel for rel in first.get("relationships", [])}
+        second_relationships = {self._relationship_key(rel): rel for rel in second.get("relationships", [])}
+
+        return {
+            "decisions_added": [second_decisions[key] for key in sorted(set(second_decisions) - set(first_decisions))],
+            "decisions_removed": [first_decisions[key] for key in sorted(set(first_decisions) - set(second_decisions))],
+            "relationships_added": [second_relationships[key] for key in sorted(set(second_relationships) - set(first_relationships))],
+            "relationships_removed": [first_relationships[key] for key in sorted(set(first_relationships) - set(second_relationships))],
+        }
+
+    def flush_checkpoint(self, label: str) -> Dict[str, Any]:
+        """Persist a named checkpoint via ``TemporalVersionManager``."""
+        if label not in self._checkpoints:
+            raise KeyError(f"Unknown checkpoint label: {label}")
+
+        if self._temporal_version_manager is None:
+            self._temporal_version_manager = TemporalVersionManager()
+
+        return self._temporal_version_manager.create_snapshot(
+            self._checkpoints[label],
+            version_label=label,
+            author=str(self.config.get("checkpoint_author", "agent_context@local.test")),
+            description=f"Checkpoint '{label}'",
+        )
+
+    def _capture_checkpoint_state(self) -> Dict[str, Any]:
+        """Capture a serializable snapshot of the current graph state."""
+        if self.knowledge_graph and hasattr(self.knowledge_graph, "state_at"):
+            return self.knowledge_graph.state_at(datetime.now())
+        if self.knowledge_graph and hasattr(self.knowledge_graph, "to_dict"):
+            graph_dict = self.knowledge_graph.to_dict()
+            return {
+                "timestamp": datetime.now().isoformat(),
+                "nodes": graph_dict.get("nodes", []),
+                "edges": graph_dict.get("edges", []),
+                "entities": graph_dict.get("nodes", []),
+                "relationships": graph_dict.get("edges", []),
+                "decisions": [
+                    {
+                        "id": node.get("id"),
+                        "category": (node.get("properties", {}) or {}).get("category", ""),
+                        "scenario": node.get("content", ""),
+                    }
+                    for node in graph_dict.get("nodes", [])
+                    if str(node.get("type", "")).lower() == "decision"
+                ],
+            }
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "nodes": [],
+            "edges": [],
+            "entities": [],
+            "relationships": [],
+            "decisions": [],
+        }
+
+    def _relationship_key(self, relationship: Dict[str, Any]) -> tuple:
+        """Build a stable comparison key for checkpoint relationship diffs."""
+        return (
+            relationship.get("source_id", relationship.get("source")),
+            relationship.get("target_id", relationship.get("target")),
+            relationship.get("type"),
+        )
 
     def get_causal_chain(
         self,

@@ -143,6 +143,22 @@ def _parse_iso_dt(value: str) -> Optional[datetime]:
         return None
 
 
+def _normalize_temporal_input(value: Optional[Union[str, int, float, datetime]]) -> Optional[str]:
+    """Normalize supported temporal inputs to ISO strings."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value.isoformat()
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc).replace(tzinfo=None).isoformat()
+    if isinstance(value, str):
+        parsed = _parse_iso_dt(value)
+        return parsed.isoformat() if parsed is not None else value
+    raise ValueError("Temporal values must be datetime, epoch seconds, ISO strings, or None")
+
+
 @dataclass
 class ContextNode:
     """Context graph node (Internal implementation)."""
@@ -1410,6 +1426,49 @@ class ContextGraph:
             )
             self._add_internal_edge(edge)
 
+    def state_at(self, timestamp: Union[str, int, float, datetime]) -> Dict[str, Any]:
+        """Return a serializable snapshot of graph state valid at the given time."""
+        at_time = self._normalize_timestamp(timestamp)
+        with self._lock:
+            active_nodes = [node for node in self.nodes.values() if node.is_active(at_time)]
+            active_node_ids = {node.node_id for node in active_nodes}
+            active_edges = [
+                edge for edge in self.edges
+                if edge.is_active(at_time)
+                and edge.source_id in active_node_ids
+                and edge.target_id in active_node_ids
+            ]
+
+        nodes_payload = [node.to_dict() for node in active_nodes]
+        edges_payload = [edge.to_dict() for edge in active_edges]
+        decisions_payload = [
+            {
+                "id": node.node_id,
+                "category": node.properties.get("category", ""),
+                "scenario": node.properties.get("scenario", node.content),
+                "reasoning": node.properties.get("reasoning", ""),
+                "outcome": node.properties.get("outcome", ""),
+                "confidence": node.properties.get("confidence", 0.0),
+                "timestamp": node.properties.get("timestamp"),
+                "decision_maker": node.properties.get("decision_maker"),
+                "entities": node.properties.get("entities", []),
+                "valid_from": node.valid_from,
+                "valid_until": node.valid_until,
+                "metadata": dict(node.properties.get("metadata", {}) or {}),
+            }
+            for node in active_nodes
+            if isinstance(node.node_type, str) and node.node_type.lower() == "decision"
+        ]
+
+        return {
+            "timestamp": at_time.isoformat(),
+            "nodes": nodes_payload,
+            "edges": edges_payload,
+            "entities": nodes_payload,
+            "relationships": edges_payload,
+            "decisions": decisions_payload,
+        }
+
     # Decision Support Methods
     def add_decision(self, decision: "Decision") -> None:
         """
@@ -1444,7 +1503,9 @@ class ContextGraph:
                 "reasoning_embedding": decision.reasoning_embedding,
                 "node2vec_embedding": decision.node2vec_embedding,
                 **metadata
-            }
+            },
+            valid_from=decision.valid_from,
+            valid_until=decision.valid_until,
         )
         self._add_internal_node(node)
 
@@ -1483,7 +1544,8 @@ class ContextGraph:
             source_id=source_decision_id,
             target_id=target_decision_id,
             edge_type=relationship_type,
-            weight=1.0
+            weight=1.0,
+            metadata={"recorded_at": datetime.now().isoformat()},
         )
         self._add_internal_edge(edge)
 
@@ -1542,6 +1604,8 @@ class ContextGraph:
                             decision_maker=decision_data.get("decision_maker", ""),
                             reasoning_embedding=decision_data.get("reasoning_embedding"),
                             node2vec_embedding=decision_data.get("node2vec_embedding"),
+                            valid_from=node.valid_from,
+                            valid_until=node.valid_until,
                             metadata={k: v for k, v in decision_data.items() if k not in [
                                 "category", "scenario", "reasoning", "outcome", "confidence", 
                                 "timestamp", "decision_maker", "reasoning_embedding", "node2vec_embedding"
@@ -1607,6 +1671,8 @@ class ContextGraph:
                         decision_maker=decision_data.get("decision_maker", ""),
                         reasoning_embedding=decision_data.get("reasoning_embedding"),
                         node2vec_embedding=decision_data.get("node2vec_embedding"),
+                        valid_from=node.valid_from,
+                        valid_until=node.valid_until,
                         metadata={k: v for k, v in decision_data.items() if k not in [
                             "category", "scenario", "reasoning", "outcome", "confidence", 
                             "timestamp", "decision_maker", "reasoning_embedding", "node2vec_embedding"
@@ -1879,6 +1945,8 @@ class ContextGraph:
         entities: Optional[List[str]] = None,
         decision_maker: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        valid_from: Optional[Union[str, int, float, datetime]] = None,
+        valid_until: Optional[Union[str, int, float, datetime]] = None,
         **kwargs
     ) -> str:
         """
@@ -1973,6 +2041,8 @@ class ContextGraph:
         confidence = float(confidence)
         entities = [entity.strip() for entity in (entities or []) if entity.strip()]
         decision_maker = decision_maker.strip() if decision_maker else None
+        normalized_valid_from = _normalize_temporal_input(valid_from)
+        normalized_valid_until = _normalize_temporal_input(valid_until)
         
         # Create decision record
         decision = {
@@ -1985,6 +2055,9 @@ class ContextGraph:
             "entities": entities,
             "decision_maker": decision_maker,
             "timestamp": timestamp,
+            "recorded_at": datetime.now().isoformat(),
+            "valid_from": normalized_valid_from,
+            "valid_until": normalized_valid_until,
             "metadata": metadata or {},
             **kwargs
         }
@@ -2018,6 +2091,8 @@ class ContextGraph:
         limit: int = 10,
         similarity_threshold: float = 0.5,
         use_semantic_search: bool = True,
+        include_superseded: bool = False,
+        as_of: Optional[Union[str, int, float, datetime]] = None,
         **filters
     ) -> List[Dict[str, Any]]:
         """
@@ -2036,6 +2111,7 @@ class ContextGraph:
         """
         if not hasattr(self, '_decisions') or not self._decisions:
             return []
+        as_of_time = self._normalize_timestamp(as_of) if as_of is not None else None
         
         candidates = set()
         
@@ -2056,6 +2132,12 @@ class ContextGraph:
         precedents = []
         for decision_id in candidates:
             decision = self._decisions[decision_id]
+            if not self._decision_matches_temporal_filters(
+                decision,
+                include_superseded=include_superseded,
+                as_of=as_of_time,
+            ):
+                continue
             
             # Content similarity
             content_sim = self._calculate_decision_content_similarity(scenario, decision)
@@ -2347,6 +2429,9 @@ class ContextGraph:
                     "entities",
                     "decision_maker",
                     "timestamp",
+                    "recorded_at",
+                    "valid_from",
+                    "valid_until",
                     "metadata",
                 }
             }
@@ -2355,6 +2440,8 @@ class ContextGraph:
                 decision["id"],
                 "decision",
                 content=decision["scenario"],
+                valid_from=decision.get("valid_from"),
+                valid_until=decision.get("valid_until"),
                 category=decision["category"],
                 outcome=decision["outcome"],
                 confidence=decision["confidence"],
@@ -2417,6 +2504,31 @@ class ContextGraph:
             
         except Exception as e:
             self.logger.exception("Failed to add decision to graph")
+
+    def _decision_matches_temporal_filters(
+        self,
+        decision: Dict[str, Any],
+        include_superseded: bool = False,
+        as_of: Optional[datetime] = None,
+    ) -> bool:
+        """Return True when a decision matches temporal filter rules."""
+        valid_from = _parse_iso_dt(decision.get("valid_from")) if decision.get("valid_from") else None
+        valid_until = _parse_iso_dt(decision.get("valid_until")) if decision.get("valid_until") else None
+        reference_time = as_of or datetime.utcnow()
+
+        if as_of is not None:
+            if valid_from is not None and reference_time < valid_from:
+                return False
+            if valid_until is not None and reference_time > valid_until:
+                return False
+            return True
+
+        if include_superseded:
+            return True
+
+        if valid_until is not None and reference_time > valid_until:
+            return False
+        return True
     
     def _calculate_decision_content_similarity(self, scenario: str, decision: Dict[str, Any]) -> float:
         """Calculate content similarity between scenario and decision."""
