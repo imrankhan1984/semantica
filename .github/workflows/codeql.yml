@@ -14,23 +14,43 @@ permissions:
   actions: read
 
 jobs:
+  disable-default-setup:
+    name: Disable CodeQL Default Setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Switch Default Setup to not-configured
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Disabling CodeQL Default Setup..."
+          gh api repos/${{ github.repository }}/code-scanning/default-setup \
+            -X PATCH \
+            -f state=not-configured
+
+      - name: Wait for Default Setup state to propagate
+        run: sleep 30
+
+      - name: Confirm Default Setup is disabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          STATE=$(gh api repos/${{ github.repository }}/code-scanning/default-setup \
+            --jq '.state')
+          echo "Default Setup state: $STATE"
+          if [ "$STATE" != "not-configured" ]; then
+            echo "Default Setup is still enabled — cannot proceed with Advanced Setup."
+            exit 1
+          fi
+          echo "Default Setup confirmed disabled. Proceeding with Advanced Setup."
+
   analyze:
     name: Analyze Python
     runs-on: ubuntu-latest
+    needs: disable-default-setup
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Disable CodeQL Default Setup
-        # Advanced Setup (this workflow) and Default Setup cannot run simultaneously.
-        # This step switches Default Setup to not-configured so SARIF upload succeeds.
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api repos/${{ github.repository }}/code-scanning/default-setup \
-            -X PATCH \
-            -f state=not-configured || true
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
