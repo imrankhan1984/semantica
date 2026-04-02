@@ -19,6 +19,7 @@ Covers gaps not addressed by existing test files:
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -292,6 +293,7 @@ class TestNamedTagsAdditional:
         manager = TemporalVersionManager()
         graph.add_node("n1", "entity")
         manager.create_snapshot(
+        snap = manager.create_snapshot(
             graph.to_dict(),
             version_label="v1.0",
             author="user@example.com",
@@ -873,6 +875,7 @@ class TestOllamaProviderBaseURLGap:
         with patch.dict("sys.modules", {"ollama": ollama_mock}):
             from semantica.semantic_extract.providers import OllamaProvider
             OllamaProvider(
+            provider = OllamaProvider(
                 model_name="llama3",
                 base_url="http://192.168.1.10:11434",
             )
