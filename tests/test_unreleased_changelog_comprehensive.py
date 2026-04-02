@@ -292,7 +292,6 @@ class TestNamedTagsAdditional:
         graph = ContextGraph()
         manager = TemporalVersionManager()
         graph.add_node("n1", "entity")
-        manager.create_snapshot(
         snap = manager.create_snapshot(
             graph.to_dict(),
             version_label="v1.0",
