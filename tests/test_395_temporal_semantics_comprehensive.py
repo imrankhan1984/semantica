@@ -17,7 +17,6 @@ Already covered separately:
 
 from __future__ import annotations
 
-import time
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -1062,6 +1061,8 @@ class TestFindPrecedentsAsOf:
         # Bob's decision should be reachable; Alice's should not appear
         # (implementation may not filter on valid_from, just check it doesn't crash)
         assert isinstance(precedents, list)
+        assert "approve loan for Bob" in scenarios
+        assert "approve loan for Alice" not in scenarios
 
     def test_find_precedents_no_as_of_returns_list(self):
         self.graph.record_decision(

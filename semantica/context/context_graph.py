@@ -1483,6 +1483,8 @@ class ContextGraph:
         confidence: float = 0.5,
         entities: Optional[List[str]] = None,
         decision_maker: Optional[str] = "system",
+        valid_from=None,
+        valid_until=None,
         **kwargs,
     ) -> str:
         """
@@ -1506,12 +1508,23 @@ class ContextGraph:
             confidence: Confidence score (0.0–1.0)
             entities: Related entity labels
             decision_maker: Who made the decision
+            valid_from: Start of validity window (ISO string or datetime)
+            valid_until: End of validity window (ISO string or datetime)
             **kwargs: Extra metadata stored on the decision node
 
         Returns:
             Decision ID
         """
         from .decision_models import Decision
+
+        if decision is not None and (
+            any(v is not None for v in (
+                category, scenario, reasoning, outcome, entities, valid_from, valid_until,
+            )) or kwargs
+        ):
+            raise ValueError(
+                "Pass either a Decision object or keyword arguments, not both."
+            )
 
         if decision is None:
             # Build from kwargs — delegate to record_decision which handles ID gen
@@ -1523,6 +1536,8 @@ class ContextGraph:
                 confidence=confidence,
                 entities=entities,
                 decision_maker=decision_maker,
+                valid_from=valid_from,
+                valid_until=valid_until,
                 metadata=kwargs,
             )
 
