@@ -71,11 +71,6 @@ Everything you need to reason about *when* — not just *what*.
 - **Named checkpoints** — snapshot the full agent context at any moment and diff two snapshots to see exactly what changed.
 
 → [Temporal docs](docs/reference/) · [Temporal examples](cookbook/)
-## Unreleased / Coming Next
-
-| Area | Highlights |
-|------|-----------|
-| **SHACL Constraints** | `OntologyEngine.to_shacl()` auto-derives SHACL shapes from any OWL ontology; `validate_graph()` returns structured `SHACLValidationReport` with plain-English violation explanations; three quality tiers (`"basic"`, `"standard"`, `"strict"`); three output formats (Turtle, JSON-LD, N-Triples); 3-level inheritance propagation |
 
 ---
 
