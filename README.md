@@ -53,26 +53,6 @@ pip install semantica
 
 ---
 
-## 🚀 What's New in v0.4.0
-
-**1,162+ tests · 0 failures · 0 regressions**
-
-### 🕐 Temporal Intelligence Stack
-
-Everything you need to reason about *when* — not just *what*.
-
-- **Temporal GraphRAG** — retrieve knowledge as it existed at any point in the past. Natural-language queries like *"what did we know before the 2024 merger?"* are automatically parsed for temporal intent, with zero LLM calls.
-- **Allen Interval Algebra** — 13 deterministic interval relations (before, meets, overlaps, during, starts, finishes, equals, and their converses). Find gaps, measure coverage, detect cycles — all without touching an LLM.
-- **Point-in-time Query Engine** — reconstruct a self-consistent graph snapshot at any timestamp. Comes with a consistency validator that catches 5 classes of temporal errors: inverted intervals, dangling edges, overlapping relations, temporal gaps, and missing entities.
-- **Temporal Metadata Extraction** — ask the LLM to annotate each extracted relation with `valid_from`, `valid_until`, and a calibrated confidence score (0–1 scale with baked-in anchors, so the model doesn't cluster near 1.0).
-- **TemporalNormalizer** — converts ISO 8601, partial dates, relative phrases ("last year", "Q1 2024"), and 13 domain-specific phrase maps (Healthcare, Finance, Cybersecurity, Supply Chain, Energy…) into UTC datetime pairs. Zero LLM calls.
-- **Bi-temporal Provenance** — every provenance record is automatically stamped with transaction time. Full revision history and audit log export in JSON or CSV. Temporal relationships export as OWL-Time RDF triples.
-- **Decision validity windows** — decisions now carry `valid_from` / `valid_until`. Superseded decisions stay in the graph — history is immutable. Point-in-time causal chain reconstruction included.
-- **Named checkpoints** — snapshot the full agent context at any moment and diff two snapshots to see exactly what changed.
-
-→ [Temporal docs](docs/reference/) · [Temporal examples](cookbook/)
-
----
 
 ## Features
 
@@ -160,6 +140,23 @@ Everything you need to reason about *when* — not just *what*.
 - **Quality tiers** — `"basic"` (structure + cardinality), `"standard"` (+ enumerations, inheritance), `"strict"` (+ `sh:closed` rejects undeclared properties)
 - **Inheritance propagation** — child shapes automatically include all ancestor property shapes (up to 3+ levels), cycle-safe
 - **Three output formats** — Turtle (`.ttl`), JSON-LD, N-Triples; file export via `export_shacl()`
+
+## 🚀 What's New in v0.4.0
+
+### 🕐 Temporal Intelligence Stack
+
+Everything you need to reason about *when* — not just *what*.
+
+- **Temporal GraphRAG** — retrieve knowledge as it existed at any point in the past. Natural-language queries like *"what did we know before the 2024 merger?"* are automatically parsed for temporal intent, with zero LLM calls.
+- **Allen Interval Algebra** — 13 deterministic interval relations (before, meets, overlaps, during, starts, finishes, equals, and their converses). Find gaps, measure coverage, detect cycles — all without touching an LLM.
+- **Point-in-time Query Engine** — reconstruct a self-consistent graph snapshot at any timestamp. Comes with a consistency validator that catches 5 classes of temporal errors: inverted intervals, dangling edges, overlapping relations, temporal gaps, and missing entities.
+- **Temporal Metadata Extraction** — ask the LLM to annotate each extracted relation with `valid_from`, `valid_until`, and a calibrated confidence score (0–1 scale with baked-in anchors, so the model doesn't cluster near 1.0).
+- **TemporalNormalizer** — converts ISO 8601, partial dates, relative phrases ("last year", "Q1 2024"), and 13 domain-specific phrase maps (Healthcare, Finance, Cybersecurity, Supply Chain, Energy…) into UTC datetime pairs. Zero LLM calls.
+- **Bi-temporal Provenance** — every provenance record is automatically stamped with transaction time. Full revision history and audit log export in JSON or CSV. Temporal relationships export as OWL-Time RDF triples.
+- **Decision validity windows** — decisions now carry `valid_from` / `valid_until`. Superseded decisions stay in the graph — history is immutable. Point-in-time causal chain reconstruction included.
+- **Named checkpoints** — snapshot the full agent context at any moment and diff two snapshots to see exactly what changed.
+
+→ [Temporal docs](docs/reference/) · [Temporal examples](cookbook/)
 
 ### 📚 SKOS Vocabulary Management
 
